@@ -1,6 +1,5 @@
 # Workflow tests use faked engines and do not download model weights.
-# Keep the tested core versions aligned with the application.
--c requirements.txt
+# CI applies versions from requirements.txt after normalizing extras syntax.
 setuptools>=68
 pytest
 fastapi
