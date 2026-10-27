@@ -1,0 +1,38 @@
+# Python 3.12 on Apple Silicon (tested on M1 Max, macOS 15). System dependency: brew install ffmpeg
+# Versions are the set verified together; coqui-tts is the maintained fork of Coqui TTS
+# (the original TTS==0.22.0 package does not install on Python >= 3.12).
+
+# --- Backend & UI ---
+fastapi==0.150.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.32
+streamlit==1.66.0
+pandas==3.0.6
+pydantic==2.14.1
+pydantic-settings==2.16.0
+SQLAlchemy==2.1.5
+python-dotenv==1.2.4
+httpx==0.28.1
+openai==3.35.1
+
+# --- ASR (Apple MLX / Metal) ---
+mlx==0.32.4
+mlx-whisper==0.4.3
+
+# --- TTS voice cloning (PyTorch + Metal MPS) ---
+coqui-tts[codec]==0.28.0
+torch==2.14.1
+torchaudio==2.11.0
+torchcodec==0.17.0
+transformers==5.20.2
+
+# --- Audio & evaluation ---
+numpy==2.5.4
+pydub==0.25.1
+soundfile==0.14.0
+librosa==1.0.0
+jiwer==4.0.0
+num2words==0.5.14
+
+# --- Dev ---
+pytest
