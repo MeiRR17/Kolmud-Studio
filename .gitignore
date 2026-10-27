@@ -4,6 +4,9 @@ __pycache__/
 .pytest_cache/
 .env
 .DS_Store
+*.egg-info/
+build/
+dist/
 
 # Personal data: recordings, voice profile, lessons, database. Only the seed lexicon is tracked.
 data/*

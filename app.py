@@ -203,7 +203,10 @@ tab_studio, tab_lab, tab_lexicon = st.tabs([
 
 # ======================================================================== tab 1: studio
 def _save_segment_field(segment_id: int, field: str, key: str) -> None:
-    svc.update_segment(segment_id, SegmentUpdate(**{field: st.session_state[key]}))
+    seg = svc.update_segment(segment_id, SegmentUpdate(**{field: st.session_state[key]}))
+    if field == "english_display":
+        st.session_state[f"en_phon_{segment_id}"] = seg.english_tts_phonetic
+        st.session_state[f"en_coach_{segment_id}"] = seg.shadowing_coach_guide
 
 
 def _regenerate_phonetic(segment_id: int) -> None:
@@ -306,7 +309,7 @@ with tab_studio:
         t1, t2, _ = st.columns([1, 2, 2])
         if t1.button("💾 שמור תמלול"):
             svc.set_transcript(lesson.id, st.session_state[transcript_key])
-            st.toast("נשמר")
+            st.rerun()
         if t2.button("🌐 תרגם לאנגלית תורנית + הזרקה פונטית + מדריך מבטא", type="primary"):
             text = st.session_state[transcript_key]
             if not text.strip():
@@ -327,11 +330,13 @@ with tab_studio:
                     show_error(exc)
         if lesson.segments:
             st.caption("⚠️ תרגום מחדש מחליף את כל הפסקאות הקיימות (כולל האודיו והיסטוריית האימונים שלהן).")
+            if lesson.translation_is_stale:
+                st.warning("התמלול השתנה או שהתרגום נוצר בגרסה ישנה. יש לתרגם מחדש לפני הפקת אודיו וייצוא.")
 
         if lesson.segments:
             st.divider()
             st.subheader("שלב ג׳: בקרת תסריט והפקת אודיו בקולך")
-            ready = sum(1 for s in lesson.segments if s.audio_path and not s.audio_is_stale)
+            ready = sum(1 for s in lesson.segments if abs_path(s.audio_path) and not s.audio_is_stale)
             st.progress(ready / len(lesson.segments), text=f"{ready}/{len(lesson.segments)} פסקאות עם אודיו עדכני")
 
             for seg in lesson.segments:
@@ -339,7 +344,7 @@ with tab_studio:
 
             g1, g2 = st.columns(2)
             if g1.button("🎙️ הפק את כל הפסקאות החסרות/שעודכנו", type="primary"):
-                todo = [s for s in lesson.segments if not s.audio_path or s.audio_is_stale]
+                todo = [s for s in lesson.segments if not abs_path(s.audio_path) or s.audio_is_stale]
                 bar = st.progress(0.0)
                 try:
                     for i, seg in enumerate(todo):
@@ -350,15 +355,21 @@ with tab_studio:
                 except Exception as exc:  # noqa: BLE001
                     bar.empty()
                     show_error(exc)
-            if g2.button("🧩 אחד לקובץ שיעור מלא (WAV + MP3 + כתוביות SRT)", disabled=ready == 0):
+            if g2.button("🧩 אחד לקובץ שיעור מלא (WAV + MP3 + כתוביות SRT)",
+                         disabled=ready != len(lesson.segments) or lesson.translation_is_stale):
                 try:
                     with st.spinner("מאחד…"):
                         master = svc.build_master(lesson.id)
-                    st.session_state[f"master_{lesson.id}"] = master.model_dump()
                 except Exception as exc:  # noqa: BLE001
                     show_error(exc)
 
-            if (master := st.session_state.get(f"master_{lesson.id}")) and Path(master["mp3_path"]).exists():
+            master = None
+            if svc.get_lesson(lesson.id).master_audio_path:
+                try:
+                    master = svc.get_master(lesson.id).model_dump()
+                except Exception as exc:
+                    show_error(exc)
+            if master:
                 st.success(f"השיעור המלא מוכן: {master['segment_count']} פסקאות · {master['duration_seconds'] / 60:.1f} דקות")
                 st.audio(master["mp3_path"])
                 d1, d2, d3 = st.columns(3)

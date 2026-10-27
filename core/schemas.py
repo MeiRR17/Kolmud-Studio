@@ -36,6 +36,7 @@ class LessonOut(LessonSummary):
     source_audio_path: str | None
     hebrew_transcript: str
     master_audio_path: str | None
+    translation_is_stale: bool
     segments: list[SegmentOut]
 
 

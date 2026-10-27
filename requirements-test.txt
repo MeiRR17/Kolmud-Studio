@@ -1,0 +1,16 @@
+# Workflow tests use faked engines and do not download model weights.
+# CI applies versions from requirements.txt after normalizing extras syntax.
+setuptools>=68
+pytest
+fastapi
+python-multipart
+pydantic-settings
+SQLAlchemy
+httpx
+numpy
+soundfile
+jiwer
+num2words
+pydub
+# Self-contained test ffmpeg; no runner-wide apt upgrade needed.
+imageio-ffmpeg==0.6.0
