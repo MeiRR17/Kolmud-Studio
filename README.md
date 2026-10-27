@@ -1,4 +1,11 @@
-# Kolmud Studio — TorahVoice Studio & Accent Lab
+# Kolmud Studio v0.1.0 — TorahVoice Studio & Accent Lab
+
+[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.1.0)
+
+**Status: initial alpha.** See the [v0.1.0 release notes](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.1.0)
+and [changelog](CHANGELOG.md) for features, validation, and known limitations.
+The application version is defined in `core/__init__.py` and shared by the UI,
+API documentation, and `/health` response.
 
 Local-first app that turns a recorded Hebrew Torah/Halacha shiur into an English shiur in **your own cloned voice**, and doubles as a **shadowing lab** for training a General American accent against that voice.
 

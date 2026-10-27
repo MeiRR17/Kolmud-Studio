@@ -12,12 +12,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from core import __version__
 from core.config import detect_hardware, get_settings
 from core.llm_translator import list_ollama_models
 from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice
 from core.schemas import AttemptOut, LessonOut, SegmentOut, SegmentUpdate
 
-st.set_page_config(page_title="Kolmud Studio", page_icon="🎙️", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title=f"Kolmud Studio v{__version__}", page_icon="🎙️", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown(
     """
@@ -101,6 +102,7 @@ def abs_path(stored: str | None) -> Path | None:
 # ======================================================================== sidebar
 with st.sidebar:
     st.title("🎙️ Kolmud Studio")
+    st.caption(f"v{__version__}")
     hw = hardware()
     st.caption(
         f"{hw.get('chip') or 'Apple Silicon'} · MLX Metal: {'✅' if hw['mlx_metal'] else '❌'}"

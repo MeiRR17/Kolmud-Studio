@@ -2,6 +2,10 @@
 
 Last reviewed: 2026-10-27.
 
+Current application version: **0.1.0 (initial alpha)**. The version is defined in
+`core/__init__.py` and displayed in the Streamlit sidebar, browser tab title,
+API documentation, and `/health`. See `CHANGELOG.md` for release details.
+
 ## Current implementation
 
 This local-first Python application turns recorded Hebrew Torah/Halacha lessons

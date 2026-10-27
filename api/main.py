@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Uploa
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from core import __version__
 from core.audio_utils import AudioToolError
 from core.config import detect_hardware, get_settings
 from core.llm_translator import TranslationError, list_ollama_models
@@ -20,7 +21,7 @@ from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
 from core.tts_cloner import TTSError
 
-app = FastAPI(title="Kolmud Studio — TorahVoice & Accent Lab", version="1.0.0")
+app = FastAPI(title="Kolmud Studio — TorahVoice & Accent Lab", version=__version__)
 
 
 @lru_cache(maxsize=1)
@@ -88,6 +89,7 @@ def _tts_choice(svc: StudioService, body: SynthesizeRequest | None) -> TTSChoice
 def health(svc: Service) -> dict:
     return {
         "status": "ok",
+        "version": __version__,
         "hardware": detect_hardware(),
         "ollama_models": list_ollama_models(svc.settings.ollama_base_url),
         "reference_voice": svc.settings.reference_voice_path.exists(),
