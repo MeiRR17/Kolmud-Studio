@@ -23,15 +23,13 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements*.txt
-      - name: Audio tools
-        run: |
-          if ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=30
-            sudo apt-get install -y ffmpeg libsndfile1
-          fi
-          ffmpeg -version
       - name: Install workflow test dependencies
         run: python -m pip install -r requirements-test.txt
+      - name: Expose packaged test ffmpeg
+        run: |
+          mkdir -p "$RUNNER_TEMP/kolmud-tools"
+          ln -s "$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')" "$RUNNER_TEMP/kolmud-tools/ffmpeg"
+          echo "$RUNNER_TEMP/kolmud-tools" >> "$GITHUB_PATH"
       - name: Install terminal entry point
         run: python -m pip install -e . --no-deps --no-build-isolation
       - name: Tests (simulated model engines)

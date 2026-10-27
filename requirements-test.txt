@@ -13,3 +13,5 @@ soundfile
 jiwer
 num2words
 pydub
+# Self-contained test ffmpeg; no runner-wide apt upgrade needed.
+imageio-ffmpeg==0.6.0
