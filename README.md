@@ -24,6 +24,45 @@ Practice: you record a paragraph ──► English Whisper ──► clarity %, 
 
 Everything except the optional API providers runs offline on the Mac.
 
+## Development: terminal jobs and review handoff
+
+The development branch adds a local CLI and a file-based Dvir OS review handoff.
+These changes are **not included in the published v0.1.0 tag**. See
+[the integration contract](docs/integrations/dvir-os.md) for acceptance criteria,
+recovery behavior, model policy, and remaining integration work.
+
+After installing the existing requirements, install the entry point from this checkout:
+
+```bash
+source .venv/bin/activate
+pip install -e . --no-deps --no-build-isolation
+kolmud --version
+kolmud doctor
+kolmud run /path/to/lesson.m4a --title "My lesson"                 # transcription only
+kolmud resume JOB_ID --until translation                          # local English translation
+kolmud resume JOB_ID --until master                               # explicitly request cloned speech + exports
+kolmud status JOB_ID
+kolmud jobs
+```
+
+`python -m kolmud` is an equivalent entry point. Commands emit JSON and return a
+nonzero exit status on failure. Use the same `--data-dir /absolute/path` **before**
+the command on every invocation if storing data outside the checkout. The default
+uses the same configured data directory as the UI and API. Installation above is
+from a source checkout, not a standalone application bundle.
+
+The CLI permits **local Ollama and XTTS only**; cloud providers configured for the
+interactive UI are refused by jobs before processing begins. `--until master`
+also requires an existing reference voice and prior XTTS license acceptance.
+Models may need a first-time download. No background service is installed.
+
+Jobs persist under `data/jobs/`. Every completed/failed attempt writes
+`data/jobs/JOB_ID/manifest.json` and `agent-run.json`, plus a text snapshot of the
+lesson. Import **agent-run.json** manually in Dvir OS's agent review screen.
+`NEEDS_HUMAN` means the requested processing finished and needs content review;
+it does not mean the lesson is approved or published. Local file paths and hashes
+are references, not automatically uploaded media or clickable web downloads.
+
 ## Setup (Apple Silicon, Python 3.12)
 
 ```bash
@@ -56,8 +95,14 @@ Both share the same SQLite database (`data/kolmud.db`) and lesson folders (`data
 1. **Sidebar → reference voice.** Upload or record 15–30 s of clean speech. Read it **in English with your best American accent** — zero-shot cloning copies pronunciation habits as well as timbre, so an English reference gives a much cleaner accent than a Hebrew one.
 2. **Sidebar → new lesson.**
 3. **Studio tab.** Upload the Hebrew recording → transcribe → fix the transcript → translate. Long shiurim are split into ~1,400-character chunks (with the previous paragraph passed as continuity context), so local models with limited context work.
-4. Review each paragraph: edits save automatically. If you edit the display text, **🔁 rebuild the phonetic script** from it + the lexicon. Paragraphs whose TTS script changed after their audio was generated are marked ⚠️.
+4. Review each paragraph: edits save automatically. On the development branch,
+   editing display text rebuilds the phonetic script and coaching guide automatically;
+   explicit script/guide overrides are retained. Paragraphs whose TTS script changed
+   after their audio was generated are marked ⚠️. In v0.1.0, use **🔁 rebuild the phonetic script** manually.
 5. Generate audio per paragraph or all at once → **merge** into WAV/MP3 + SRT.
+   On the development branch, export/download requires every paragraph's current
+   audio and a translation of the current transcript. Edits invalidate previous
+   masters; old files are retained but not served as current output.
 6. **Lab tab.** Read the colour-coded guide (stress, ‿ linking, flap-T, reductions), listen at 0.75× / 0.9× / 1×, record yourself, get a score and a word-level diff. Every attempt is stored, with a progress chart per paragraph.
 7. **Lexicon tab.** Add/edit terms (`Chacham → Khah-khahm`), and audition a respelling in your cloned voice.
 

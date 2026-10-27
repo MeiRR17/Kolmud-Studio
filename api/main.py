@@ -17,7 +17,8 @@ from core import __version__
 from core.audio_utils import AudioToolError
 from core.config import detect_hardware, get_settings
 from core.llm_translator import TranslationError, list_ollama_models
-from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice
+from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, WorkflowStateError
+from core.runtime import PipelineBusyError
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
 from core.tts_cloner import TTSError
 
@@ -38,6 +39,8 @@ async def _not_found(_: Request, exc: NotFoundError) -> JSONResponse:
 
 
 @app.exception_handler(FileNotFoundError)
+@app.exception_handler(WorkflowStateError)
+@app.exception_handler(PipelineBusyError)
 async def _missing_file(_: Request, exc: FileNotFoundError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
@@ -154,7 +157,8 @@ def synthesize_lesson(lesson_id: int, svc: Service, body: SynthesizeRequest | No
                       only_missing: bool = True) -> LessonOut:
     choice = _tts_choice(svc, body)
     for seg in svc.get_lesson(lesson_id).segments:
-        if not only_missing or not seg.audio_path or seg.audio_is_stale:
+        path = svc.abs_path(seg.audio_path)
+        if not only_missing or path is None or not path.is_file() or seg.audio_is_stale:
             svc.synthesize_segment(seg.id, choice)
     return svc.get_lesson(lesson_id)
 
@@ -166,13 +170,8 @@ def build_master(lesson_id: int, svc: Service) -> MasterOutputs:
 
 @app.get("/lessons/{lesson_id}/master/{kind}")
 def download_master(lesson_id: int, kind: Literal["wav", "mp3", "srt"], svc: Service) -> FileResponse:
-    lesson = svc.get_lesson(lesson_id)
-    wav = svc.abs_path(lesson.master_audio_path)
-    if wav is None:
-        raise HTTPException(409, "Build the master file first")
-    path = wav.with_suffix(f".{kind}")
-    if not path.exists():
-        raise HTTPException(404, f"{path.name} not found")
+    master = svc.get_master(lesson_id)
+    path = Path(getattr(master, f"{kind}_path"))
     return FileResponse(path, filename=f"lesson_{lesson_id}.{kind}")
 
 

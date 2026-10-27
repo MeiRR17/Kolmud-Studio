@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — local executor and Dvir OS handoff
+
+- Installable `kolmud` command (`run`, `resume`, `status`, `jobs`, `doctor`, `--version`)
+  sharing the service layer with Streamlit and FastAPI.
+- Persisted single-host jobs, atomic private checkpoints, resume of completed
+  stages/paragraphs, source hashes, and model/voice provenance.
+- Explicit transcript/translation/audio/master targets. Transcription is the
+  default; cloud inference providers are refused by the CLI.
+- File-based content manifest and agent-run v1 review report for Dvir OS;
+  text/media references and hashes, failed checks and human review requirements.
+- Capacity guards across Kolmud UI/API/CLI using the same data directory.
+- Complete/current export checks, checksum verification on download, immutable
+  export generations, and invalidation after edits or regenerated audio.
+- Automatic phonetic/coaching rebuild after English display edits.
+- Additive SQLite upgrade preserving legacy lessons. Legacy translations need
+  explicit retranslation before synthesis/export because their provenance is unknown.
+- Automated restart, integrity, policy, migration and CLI coverage. Model-quality
+  pilot and live Dvir OS orchestration are still outstanding.
+- GitHub Actions workflow runs the model-free tests and checks the installed CLI
+  without downloading model weights or using inference credentials.
+
 ## [0.1.0](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.1.0) — 2026-10-27
 
 Initial alpha release of Kolmud Studio for local use on Apple Silicon with Python 3.12.

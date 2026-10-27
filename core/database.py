@@ -30,10 +30,16 @@ class Lesson(Base):
     hebrew_transcript: Mapped[str] = mapped_column(Text, default="")
     asr_segments: Mapped[list | None] = mapped_column(JSON)
     master_audio_path: Mapped[str | None] = mapped_column(String(1000))
+    translation_source_text: Mapped[str | None] = mapped_column(Text)
+    master_signature: Mapped[str | None] = mapped_column(String(64))
 
     segments: Mapped[list[Segment]] = relationship(
         back_populates="lesson", cascade="all, delete-orphan", order_by="Segment.position"
     )
+
+    @property
+    def translation_is_stale(self) -> bool:
+        return bool(self.segments) and self.translation_source_text != self.hebrew_transcript
 
 
 class Segment(Base):
@@ -91,6 +97,14 @@ def get_engine(database_url: str) -> Engine:
         cur.close()
 
     Base.metadata.create_all(engine)
+    # Additive upgrade from v0.1.0. Serialize inspection/ALTER across UI and API
+    # processes. Legacy translations stay unverified until explicitly rebuilt.
+    with engine.begin() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(lessons)")}
+        for name, kind in (("translation_source_text", "TEXT"), ("master_signature", "VARCHAR(64)")):
+            if name not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE lessons ADD COLUMN {name} {kind}")
     return engine
 
 

@@ -6,6 +6,11 @@ Current application version: **0.1.0 (initial alpha)**. The version is defined i
 `core/__init__.py` and displayed in the Streamlit sidebar, browser tab title,
 API documentation, and `/health`. See `CHANGELOG.md` for release details.
 
+Development branch `codex/dvir-local-pipeline` adds checkpointed CLI jobs and
+a file-based Dvir OS agent-review handoff. It also fixes export consistency and
+automatic edit propagation. The published v0.1.0 tag is unchanged. See
+`docs/integrations/dvir-os.md` and the Unreleased changelog before continuing.
+
 ## Current implementation
 
 This local-first Python application turns recorded Hebrew Torah/Halacha lessons
@@ -39,12 +44,14 @@ of an American accent. See `README.md` for setup and usage.
 2. Run a 2–5 minute Hebrew lesson through transcription, translation, cloned
    speech, and export. Review translation fidelity, Torah terminology, voice
    similarity, pronunciation, and processing time.
-3. Improve export completeness checks: `StudioService.build_master` currently
-   skips paragraphs without existing audio files and does not reject stale audio.
-   Make incomplete or stale exports explicit to the user.
-4. Review edit propagation: changing display text currently requires manually
-   rebuilding the phonetic script before regenerating audio. Review consistency
-   of coaching text, subtitles, and previously generated master files as well.
+3. Review/test the development branch before release. It rejects incomplete/stale
+   exports and downloads, automatically rebuilds phonetics/coaching after English
+   edits, and tracks transcript-to-translation provenance. Before opening an
+   existing production database on this branch, take a SQLite backup: two nullable
+   columns are added automatically. Legacy lessons are retained but translations
+   need explicit retranslation before synthesis/export.
+4. Import a locally produced `agent-run.json` in Dvir OS for a real user trial.
+   File/contract validation is not a deployed bridge, scheduler or media uploader.
 5. Address issues found in the pilot before processing full-length lessons.
 
 ## Continuing on another computer

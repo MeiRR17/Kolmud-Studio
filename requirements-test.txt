@@ -1,0 +1,15 @@
+# Workflow tests use faked engines and do not download model weights.
+# Keep the tested core versions aligned with the application.
+-c requirements.txt
+setuptools>=68
+pytest
+fastapi
+python-multipart
+pydantic-settings
+SQLAlchemy
+httpx
+numpy
+soundfile
+jiwer
+num2words
+pydub

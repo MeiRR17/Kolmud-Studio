@@ -82,15 +82,18 @@ class Settings(BaseSettings):
         for directory in (self.data_dir, self.projects_dir, self.voice_profiles_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+    def configure_runtime(self) -> None:
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        if self.xtts_accept_cpml:
+            os.environ["COQUI_TOS_AGREED"] = "1"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     settings = Settings()
     settings.ensure_dirs()
     # Coqui XTTS fails on a handful of ops under Metal unless CPU fallback is allowed.
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-    if settings.xtts_accept_cpml:
-        os.environ["COQUI_TOS_AGREED"] = "1"
+    settings.configure_runtime()
     return settings
 
 

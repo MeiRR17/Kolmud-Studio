@@ -6,6 +6,8 @@ Hebrew audio -> Whisper transcript -> LLM translation (display / TTS-phonetic / 
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 import threading
 import uuid
@@ -30,11 +32,22 @@ from core.llm_translator import (
     TorahTranslatorEngine,
 )
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
+from core.prosody import add_content_word_stress, auto_coach_guide
+from core.runtime import exclusive_inference
 from core.tts_cloner import ElevenLabsVoiceCloner, TTSEngine, TTSError, XTTSVoiceCloner
 
 
 class NotFoundError(LookupError):
     pass
+
+
+class WorkflowStateError(RuntimeError):
+    """Inputs changed or required outputs are missing; further processing is unsafe."""
+
+
+def file_digest(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 @dataclass
@@ -55,6 +68,7 @@ class TTSChoice:
 class StudioService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        settings.configure_runtime()
         self.db_url = settings.database_url
         self.lexicon = PhoneticLexicon(settings.lexicon_path)
         self.asr = LocalWhisperEngine(settings.hebrew_asr_model, settings.english_asr_model)
@@ -70,6 +84,16 @@ class StudioService:
 
     def abs_path(self, stored: str | None) -> Path | None:
         return self.settings.data_dir / stored if stored else None
+
+    @staticmethod
+    def _invalidate_master(lesson: Lesson) -> None:
+        lesson.master_audio_path = None
+        lesson.master_signature = None
+
+    @staticmethod
+    def _require_current_translation(lesson: Lesson) -> None:
+        if not lesson.segments or lesson.translation_is_stale:
+            raise WorkflowStateError("Translate the current Hebrew transcript before generating or exporting audio.")
 
     # ------------------------------------------------------------------ engines
     def default_llm_choice(self) -> LLMChoice:
@@ -167,8 +191,9 @@ class StudioService:
 
     # ------------------------------------------------------------------ step 1: Hebrew
     def attach_source_audio(self, lesson_id: int, filename: str, data: bytes) -> LessonOut:
+        self.get_lesson(lesson_id)
         suffix = Path(filename).suffix.lower() or ".bin"
-        src_dir = self._lesson_dir(lesson_id) / "source"
+        src_dir = self._lesson_dir(lesson_id) / "source" / uuid.uuid4().hex
         src_dir.mkdir(parents=True, exist_ok=True)
         original = src_dir / f"original{suffix}"
         original.write_bytes(data)
@@ -176,8 +201,13 @@ class StudioService:
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
             lesson.source_audio_path = self._rel(wav)
+            lesson.hebrew_transcript = ""
+            lesson.asr_segments = None
+            lesson.translation_source_text = None
+            self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
 
+    @exclusive_inference
     def transcribe(self, lesson_id: int) -> LessonOut:
         with session_scope(self.db_url) as s:
             source = self.abs_path(self._lesson(s, lesson_id).source_audio_path)
@@ -188,17 +218,24 @@ class StudioService:
         )
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
+            if self.abs_path(lesson.source_audio_path) != source:
+                raise WorkflowStateError("Source audio changed during transcription; retry the current recording.")
             lesson.hebrew_transcript = result["full_text"]
             lesson.asr_segments = list(result["segments"])
+            self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
 
     def set_transcript(self, lesson_id: int, text: str) -> LessonOut:
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
-            lesson.hebrew_transcript = text
+            if lesson.hebrew_transcript != text:
+                lesson.hebrew_transcript = text
+                lesson.asr_segments = None
+                self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
 
     # ------------------------------------------------------------------ step 2: translation
+    @exclusive_inference
     def translate(
         self,
         lesson_id: int,
@@ -218,8 +255,11 @@ class StudioService:
         seg_dir = self._lesson_dir(lesson_id) / "segments"
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
+            if lesson.hebrew_transcript != hebrew:
+                raise WorkflowStateError("The transcript changed during translation; retry with the current text.")
             lesson.segments.clear()  # cascades; practice history belongs to the old segments
-            lesson.master_audio_path = None
+            self._invalidate_master(lesson)
+            lesson.translation_source_text = hebrew
             for t in translated:
                 lesson.segments.append(Segment(
                     position=t.segment_id,
@@ -237,8 +277,18 @@ class StudioService:
     def update_segment(self, segment_id: int, update: SegmentUpdate) -> SegmentOut:
         with session_scope(self.db_url) as s:
             seg = self._segment(s, segment_id)
-            for field, value in update.model_dump(exclude_none=True).items():
+            changes = update.model_dump(exclude_none=True)
+            display_changed = "english_display" in changes and changes["english_display"] != seg.english_display
+            for field, value in changes.items():
                 setattr(seg, field, value)
+            if display_changed:
+                terms = {t["term"]: t["phonetic"] for t in (seg.hebrew_terms or [])}
+                if "english_tts_phonetic" not in changes:
+                    seg.english_tts_phonetic = self.lexicon.apply(clean_for_tts(seg.english_display), extra=terms)
+                if "shadowing_coach_guide" not in changes:
+                    seg.shadowing_coach_guide = add_content_word_stress(auto_coach_guide(seg.english_display))
+            if changes:
+                self._invalidate_master(seg.lesson)
             return SegmentOut.model_validate(seg)
 
     def regenerate_phonetic(self, segment_id: int) -> SegmentOut:
@@ -247,25 +297,31 @@ class StudioService:
             seg = self._segment(s, segment_id)
             terms = {t["term"]: t["phonetic"] for t in (seg.hebrew_terms or [])}
             seg.english_tts_phonetic = self.lexicon.apply(clean_for_tts(seg.english_display), extra=terms)
+            self._invalidate_master(seg.lesson)
             return SegmentOut.model_validate(seg)
 
     # ------------------------------------------------------------------ step 3: voice
+    @exclusive_inference
     def synthesize_segment(self, segment_id: int, tts: TTSChoice | None = None) -> SegmentOut:
         with session_scope(self.db_url) as s:
             seg = self._segment(s, segment_id)
+            self._require_current_translation(seg.lesson)
             text, lesson_id = seg.english_tts_phonetic, seg.lesson_id
         if not text.strip():
             raise TTSError("This segment has no TTS script.")
         engine = self.make_tts_engine(tts)
-        out = self._lesson_dir(lesson_id) / "segments" / f"seg_{segment_id}.wav"
+        # Unique paths preserve previous audio if synthesis fails or an edit races it.
+        out = self._lesson_dir(lesson_id) / "segments" / f"seg_{segment_id}_{uuid.uuid4().hex}.wav"
         engine.synthesize(text, out)
-        for variant in out.parent.glob(f"seg_{segment_id}@*x.wav"):
-            variant.unlink(missing_ok=True)
         with session_scope(self.db_url) as s:
             seg = self._segment(s, segment_id)
+            self._require_current_translation(seg.lesson)
+            if seg.english_tts_phonetic != text:
+                raise WorkflowStateError("The TTS script changed during synthesis; retry the segment.")
             seg.audio_path = self._rel(out)
             seg.audio_duration = audio_utils.duration_seconds(out)
             seg.audio_source_text = text
+            self._invalidate_master(seg.lesson)
             return SegmentOut.model_validate(seg)
 
     def segment_audio(self, segment_id: int, rate: float = 1.0) -> Path:
@@ -275,27 +331,67 @@ class StudioService:
             raise FileNotFoundError("No audio has been generated for this segment yet.")
         return audio_utils.tempo_variant(path, rate)
 
+    def _export_inputs(self, lesson: Lesson) -> tuple[list[Path], list[str], str]:
+        self._require_current_translation(lesson)
+        missing, stale, paths, texts, fingerprints = [], [], [], [], []
+        for seg in lesson.segments:
+            path = self.abs_path(seg.audio_path)
+            if path is None or not path.is_file():
+                missing.append(seg.position)
+            elif seg.audio_is_stale:
+                stale.append(seg.position)
+            else:
+                paths.append(path)
+                texts.append(seg.english_display)
+                fingerprints.append([seg.id, seg.english_display, seg.english_tts_phonetic, file_digest(path)])
+        if missing or stale:
+            raise WorkflowStateError(f"Cannot export an incomplete lesson. Missing audio: {missing}; stale audio: {stale}.")
+        signature = hashlib.sha256(json.dumps(
+            [lesson.hebrew_transcript, fingerprints, self.settings.segment_pause_ms], ensure_ascii=False
+        ).encode()).hexdigest()
+        return paths, texts, signature
+
+    @staticmethod
+    def _master_signature(inputs: str, wav: Path) -> str:
+        return hashlib.sha256((inputs + "".join(file_digest(wav.with_suffix(ext)) for ext in (".wav", ".mp3", ".srt"))).encode()).hexdigest()
+
+    def get_master(self, lesson_id: int) -> MasterOutputs:
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            _, texts, signature = self._export_inputs(lesson)
+            wav = self.abs_path(lesson.master_audio_path)
+            if wav is None or not all(wav.with_suffix(ext).is_file() for ext in (".wav", ".mp3", ".srt")):
+                raise WorkflowStateError("Build the complete master files first.")
+            if lesson.master_signature != self._master_signature(signature, wav):
+                raise WorkflowStateError("Master files are out of date or changed; rebuild them.")
+        return MasterOutputs(wav_path=str(wav), mp3_path=str(wav.with_suffix(".mp3")),
+                             srt_path=str(wav.with_suffix(".srt")),
+                             duration_seconds=audio_utils.duration_seconds(wav), segment_count=len(texts))
+
+    @exclusive_inference
     def build_master(self, lesson_id: int) -> MasterOutputs:
         with session_scope(self.db_url) as s:
-            segs = [(self.abs_path(x.audio_path), x.english_display) for x in self._lesson(s, lesson_id).segments]
-        ready = [(p, text) for p, text in segs if p is not None and p.exists()]
-        if not ready:
-            raise FileNotFoundError("Generate audio for at least one segment first.")
-        master_dir = self._lesson_dir(lesson_id) / "master"
+            paths, texts, signature = self._export_inputs(self._lesson(s, lesson_id))
+        master_dir = self._lesson_dir(lesson_id) / "master" / uuid.uuid4().hex
         wav = master_dir / "full_english_shiur.wav"
-        spans = audio_utils.merge_segments([p for p, _ in ready], wav, self.settings.segment_pause_ms)
+        spans = audio_utils.merge_segments(paths, wav, self.settings.segment_pause_ms)
         mp3 = audio_utils.wav_to_mp3(wav, master_dir / "full_english_shiur.mp3")
         srt = audio_utils.write_srt(
-            [audio_utils.SubtitleCue(a, b, text) for (a, b), (_, text) in zip(spans, ready)],
+            [audio_utils.SubtitleCue(a, b, text) for (a, b), text in zip(spans, texts)],
             master_dir / "full_english_shiur.srt",
         )
         with session_scope(self.db_url) as s:
-            self._lesson(s, lesson_id).master_audio_path = self._rel(wav)
+            lesson = self._lesson(s, lesson_id)
+            if self._export_inputs(lesson)[2] != signature:
+                raise WorkflowStateError("Lesson changed during export; rebuild the master.")
+            lesson.master_audio_path = self._rel(wav)
+            lesson.master_signature = self._master_signature(signature, wav)
         return MasterOutputs(
             wav_path=str(wav), mp3_path=str(mp3), srt_path=str(srt),
-            duration_seconds=round(spans[-1][1], 2), segment_count=len(ready),
+            duration_seconds=round(spans[-1][1], 2), segment_count=len(paths),
         )
 
+    @exclusive_inference
     def preview_pronunciation(self, phonetic: str, tts: TTSChoice | None = None) -> Path:
         out = self.settings.data_dir / "previews" / f"preview_{uuid.uuid4().hex[:8]}.wav"
         for old in out.parent.glob("preview_*.wav"):
@@ -303,6 +399,7 @@ class StudioService:
         return self.make_tts_engine(tts).synthesize(f"The term is, {phonetic}.", out)
 
     # ------------------------------------------------------------------ voice profile
+    @exclusive_inference
     def save_reference_voice(self, filename: str, data: bytes) -> Path:
         """Store the cloning reference as 24 kHz mono WAV, whatever format it arrived in."""
         dst = self.settings.reference_voice_path
@@ -320,6 +417,7 @@ class StudioService:
         hebrew_words = {w for term in self.lexicon.entries() for w in normalize_text(term).split()}
         return AccentAndFluencyEvaluator(is_hebrew_term=lambda w: w in hebrew_words)
 
+    @exclusive_inference
     def evaluate_practice(self, segment_id: int, data: bytes, suffix: str = ".wav") -> AttemptOut:
         with session_scope(self.db_url) as s:
             seg = self._segment(s, segment_id)

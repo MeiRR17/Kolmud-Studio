@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kolmud-studio"
+description = "Local TorahVoice production studio and accent lab"
+requires-python = ">=3.12,<3.13"
+dynamic = ["version", "dependencies"]
+
+[project.scripts]
+kolmud = "kolmud.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "api*", "kolmud*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "core.__version__"}
+dependencies = {file = ["requirements.txt"]}
