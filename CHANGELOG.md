@@ -1,6 +1,27 @@
 # Changelog
 
-## Unreleased — local executor and Dvir OS handoff
+## [0.2.0](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.2.0) — 2026-10-31
+
+First release validated by a real-model pilot (2:34 Hebrew shiur → master export on the
+M1 Max). See "Pilot results" in the README for measurements.
+
+### Fixed from the pilot
+
+- Hebrew/English ASR no longer drops speech at Whisper's 30 s window boundaries: audio is
+  transcribed in pause-aligned chunks of at most 25 s (pilot 1 lost a whole halachic condition).
+- Translation prompt: "לאלתר" is "immediately" (never L'chatchila), Talmud folio numbers are
+  Hebrew numerals (דף עד = 74), no invented editorial notes, ASR mishearings of known terms
+  are corrected (שולחן ארוך → Shulchan Aruch).
+- The Ollama model is unloaded after translation (XTTS ran 2.5x slower while it stayed in GPU memory).
+- Shadowing guide is rule-based by default (`TRANSLATION_LLM_COACH_GUIDE=true` restores the LLM
+  guide); saves ~40% of generated tokens. Translation time in the pilot: 18.2 → 6.7 min.
+- Job handoff no longer fails a narrower (e.g. audio-only) job because of an outdated master left
+  by an earlier run; it lists only verified master files.
+- CLI shows engine warnings on stderr and records the synthesis device (`XTTS-v2 (mps)`), so a
+  silent Metal→CPU fallback is visible. Undecodable recordings get an actionable error message.
+- Lexicon respellings re-tuned by an XTTS + Whisper A/B test.
+
+### Local executor and Dvir OS handoff
 
 - Installable `kolmud` command (`run`, `resume`, `status`, `jobs`, `doctor`, `--version`)
   sharing the service layer with Streamlit and FastAPI.
@@ -16,8 +37,9 @@
 - Automatic phonetic/coaching rebuild after English display edits.
 - Additive SQLite upgrade preserving legacy lessons. Legacy translations need
   explicit retranslation before synthesis/export because their provenance is unknown.
-- Automated restart, integrity, policy, migration and CLI coverage. Model-quality
-  pilot and live Dvir OS orchestration are still outstanding.
+- Automated restart, integrity, policy, migration and CLI coverage. Pilot `agent-run.json`
+  files (completed and failed) were accepted by Dvir OS's own `parseRun`; a live Dvir OS
+  orchestration and a user import trial are still outstanding.
 - GitHub Actions workflow runs the model-free tests and checks the installed CLI
   without downloading model weights or using inference credentials.
 

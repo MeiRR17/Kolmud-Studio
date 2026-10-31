@@ -112,10 +112,13 @@ as an automatic cleanup step.
 
 ## Remaining work
 
-- Real Hebrew recording → transcript → reviewed translation → optional reference
-  voice → audible full export, with timings and human quality checks.
-- Real user import/review in Dvir OS; this branch tests the actual parser but
-  installs no live bridge and does not validate cross-device sync.
+- Done in v0.2.0 with synthetic speech (see README "Pilot results"): recording →
+  transcript → translation → cloned voice → audible full export, with timings, and
+  both the completed and the failed `agent-run.json` accepted by Dvir OS's own
+  `parseRun`. Still needed: the same with a human teacher's recording, the user's own
+  reference voice and a human quality review.
+- Real user import/review in the Dvir OS UI; no live bridge is installed and
+  cross-device sync is not validated.
 - Authenticated coordinator invoking this CLI, shared capacity scheduling,
   cancellation, heartbeat/retry budgets, and content-package registry.
 - Source-backed lesson planning, authentic recording/video, timings, rights,

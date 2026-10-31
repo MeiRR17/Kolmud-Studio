@@ -1,9 +1,9 @@
-# Kolmud Studio v0.1.0 — TorahVoice Studio & Accent Lab
+# Kolmud Studio v0.2.0 — TorahVoice Studio & Accent Lab
 
-[![Release v0.1.0](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.1.0)
+[![Release v0.2.0](https://img.shields.io/badge/release-v0.2.0-blue)](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.2.0)
 
-**Status: initial alpha.** See the [v0.1.0 release notes](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.1.0)
-and [changelog](CHANGELOG.md) for features, validation, and known limitations.
+**Status: alpha, piloted end to end with real local models** (see [Pilot results](#pilot-results)).
+See the [changelog](CHANGELOG.md) for features, validation, and known limitations.
 The application version is defined in `core/__init__.py` and shared by the UI,
 API documentation, and `/health` response.
 
@@ -14,7 +14,7 @@ Hebrew audio ──► mlx-whisper (ivrit-ai, Metal) ──► Hebrew transcript
             ──► LLM (Ollama local / OpenAI-compatible / Claude)
                   ├─ english_display         – academic/Orthodox English (subtitles, reading)
                   ├─ hebrew_terms            – Hebrew/Aramaic terms found + phonetic respellings
-                  └─ shadowing_coach_guide   – stress / linking / flap-T / reductions (validated)
+            ──► shadowing_coach_guide    – stress / linking / flap-T, rule-based (LLM version optional)
             ──► english_tts_phonetic = display text + lexicon + hebrew_terms (deterministic)
             ──► XTTS-v2 voice clone (MPS → CPU fallback) or ElevenLabs ──► per-paragraph WAV
             ──► master WAV + MP3 + SRT subtitles
@@ -24,10 +24,9 @@ Practice: you record a paragraph ──► English Whisper ──► clarity %, 
 
 Everything except the optional API providers runs offline on the Mac.
 
-## Development: terminal jobs and review handoff
+## Terminal jobs and review handoff
 
-The development branch adds a local CLI and a file-based Dvir OS review handoff.
-These changes are **not included in the published v0.1.0 tag**. See
+Since v0.2.0 a local CLI and a file-based Dvir OS review handoff are included. See
 [the integration contract](docs/integrations/dvir-os.md) for acceptance criteria,
 recovery behavior, model policy, and remaining integration work.
 
@@ -110,9 +109,28 @@ Both share the same SQLite database (`data/kolmud.db`) and lesson folders (`data
 
 Tested on this Mac with gemma4:26b, qwen3.5:27b and DictaLM 3.0 12B: when asked to produce the phonetic script, every model also respelled ordinary English words ("fun-dah-men-tal", "Ah-cord-ing too"), which XTTS then reads badly. So the LLM only *lists* the Hebrew terms it used, and the script is built deterministically — the lexicon always wins, LLM respellings fill gaps, English stays untouched. Glosses in parentheses become comma pauses. New terms the LLM found can be added to the lexicon from each paragraph with one click.
 
-Similarly, a shadowing guide that changes the words or is written in all caps is replaced by a rule-based one (linking ‿ and flap-T only).
+The shadowing guide is likewise built by rules by default (stress on content words, ‿ linking, flap-T). In the pilot the LLM's guides were indistinguishable from the rule-based ones while costing ~40% of all generated tokens; set `TRANSLATION_LLM_COACH_GUIDE=true` to ask the LLM anyway (a guide that changes the words or is all caps is still replaced).
 
-In that test gemma4:26b gave the most faithful translation (it applied the terminology rules) at ~45 s per 1,400-character chunk, i.e. roughly 30 minutes for an hour-long shiur.
+## Pilot results
+
+Run on 2026-10-31 on the M1 Max (64 GB) with `kolmud run … --until master`: a 2:34 Hebrew shiur on Melechet Borer (352 words, read by the macOS Hebrew voice), translated by gemma4:26b and voiced with XTTS-v2 from a 16-second English reference voice (also synthetic — no personal recording was used).
+
+| | Pilot 1 (v0.1 branch) | Pilot 2 (v0.2.0) |
+|---|---|---|
+| Hebrew ASR | 43 s · WER 7.8%, **one halachic condition dropped** | 43 s · WER 5.8%, nothing dropped |
+| Translation | 18.2 min | **6.7 min** |
+| Voice (≈4 min of audio) | 11.3 min | 10.2 min (Metal) |
+| Total | 30.4 min | **17.7 min** |
+
+What pilot 1 found, and the fix in v0.2.0:
+- **Dropped speech at 30 s window boundaries** (a whole clause at exactly 30.0 s, in every Whisper configuration) → audio is now transcribed in pause-aligned chunks of ≤ 25 s.
+- **"לאלתר" translated as "L'chatchila"**, "דף עד" as "page 70", and an invented "[the second condition is]" → explicit terminology, Hebrew-numeral and fidelity rules in the prompt. Pilot 2: "immediately", "page 74", no brackets, and "שולחן ארוך" from the ASR corrected to Shulchan Aruch.
+- **XTTS 2.5× slower while gemma4 stayed resident in GPU memory** (server keep-alive: forever) → the Ollama model is unloaded after translation.
+- **~40% of LLM output spent on the shadowing guide** → rule-based guide by default.
+
+Quality of the result: English Whisper transcribed the generated 607-word master at 7.1% WER (98% clarity counting near-spellings). Most Hebrew terms were heard as recognisable spellings (melaka, shulkan aruk, akharonim, hala-kik); the weakest respellings were tuned with an A/B test (see the lexicon). Remaining translation errors trace back to misheard words in the synthetic recording ("עכור" heard as "החור" → "dark liquid") — which is why every job ends in `NEEDS_HUMAN`.
+
+Timing caveat: during both pilots macOS background services (photo analysis, Google Drive sync, XProtect) kept the CPU/GPU busy; LLM speed was 5–11 tokens/s versus ~45 tokens/s measured on a quiet machine earlier, so expect faster runs on an idle Mac. A real recording of a human teacher, and your own reference voice, have not been tested yet.
 
 ## How scoring works
 
@@ -131,6 +149,8 @@ Whisper is a proxy for an American listener, not a phonetician: a high score mea
 | `OLLAMA_MODEL` | `gemma4:26b` | any installed model can be picked in the sidebar |
 | `OLLAMA_NUM_CTX` | `16384` | context window requested from Ollama |
 | `TRANSLATION_CHUNK_CHARS` | `1400` | lower it if a local model drops content |
+| `TRANSLATION_LLM_COACH_GUIDE` | `false` | also ask the LLM for the shadowing guide (~40% more output tokens) |
+| `OLLAMA_UNLOAD_AFTER_TRANSLATION` | `true` | free GPU memory for XTTS once translation is done |
 | `HEBREW_ASR_CONTEXT_PROMPT` | `false` | prime Whisper with Torah vocabulary; off because ivrit-ai spells the terms correctly without it, and with it the first word was dropped in testing |
 | `TTS_ENGINE` | `xtts` | or `elevenlabs` (needs API key + cloned voice ID) |
 | `TTS_DEVICE` | `auto` | Metal with automatic CPU fallback; set `cpu` if MPS output sounds wrong |
@@ -145,12 +165,17 @@ api/main.py                FastAPI server over the same service layer
 core/config.py             settings (.env) + hardware detection
 core/database.py           SQLite models: Lesson, Segment, PracticeAttempt
 core/pipeline.py           StudioService — the whole workflow
-core/asr_whisper.py        mlx-whisper: Hebrew lecture + English practice
+core/jobs.py               checkpointed CLI jobs + Dvir OS manifest / agent-run handoff
+core/runtime.py            cross-process capacity locks
+core/prosody.py            rule-based shadowing guide + guide validation
+kolmud/cli.py              `kolmud` terminal entry point
+core/asr_whisper.py        mlx-whisper in pause-aligned ≤25 s chunks: Hebrew lecture + English practice
 core/llm_translator.py     chunked translation, providers, JSON-schema output
 core/lexicon.py            phonetic lexicon (deterministic final pass)
 core/tts_cloner.py         XTTS-v2 (cached speaker latents, MPS→CPU) / ElevenLabs
 core/accent_evaluator.py   clarity / WER / WPM / word alignment
 core/audio_utils.py        ffmpeg conversion, tempo variants, merge, SRT
-prompts/halachic_translator.txt   the translation + phonetics system prompt
+prompts/halachic_translator.txt   the translation + Hebrew-terms system prompt
+prompts/shadowing_coach_guide.txt optional LLM shadowing-guide instructions
 data/lexicon.json          seed lexicon (everything else in data/ is git-ignored)
 ```
