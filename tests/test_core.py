@@ -202,8 +202,6 @@ def test_transcribe_offsets_chunk_timestamps(monkeypatch, tmp_path) -> None:
     import sys
     import types
 
-    import mlx_whisper
-
     from core import asr_whisper
 
     audio = _speech_with_pauses([20.0, 20.0])
@@ -214,7 +212,8 @@ def test_transcribe_offsets_chunk_timestamps(monkeypatch, tmp_path) -> None:
         return {"segments": [{"start": 1.0, "end": 2.0, "text": f" part{len(calls)}",
                               "words": [{"word": "w", "start": 1.0, "end": 1.5, "probability": 0.9}]}]}
 
-    monkeypatch.setattr(mlx_whisper, "transcribe", fake_transcribe)
+    # Fake modules: CI runs on Linux without MLX.
+    monkeypatch.setitem(sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=fake_transcribe))
     monkeypatch.setitem(sys.modules, "mlx_whisper.audio", types.SimpleNamespace(load_audio=lambda path: audio))
     monkeypatch.setattr(asr_whisper, "resolve_model_path", lambda repo: repo)
     src = tmp_path / "a.wav"

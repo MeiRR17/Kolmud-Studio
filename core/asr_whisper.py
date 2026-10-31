@@ -68,10 +68,22 @@ SAMPLE_RATE = 16000
 MAX_CHUNK_SECONDS = 25.0
 
 
+def _non_silent_intervals(audio: Any, top_db: float, frame: int = 1024, hop: int = 256) -> list[tuple[int, int]]:
+    """Sample ranges louder than `top_db` below the peak frame energy (like librosa.effects.split)."""
+    import numpy as np
+
+    if len(audio) < frame:
+        return [(0, len(audio))] if len(audio) else []
+    frames = np.lib.stride_tricks.sliding_window_view(audio, frame)[::hop]
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    db = 20 * np.log10(np.maximum(rms, 1e-10) / max(float(rms.max()), 1e-10))
+    loud = np.concatenate([[False], db > -top_db, [False]])
+    edges = np.flatnonzero(np.diff(loud.astype(np.int8)))
+    return [(int(a) * hop, min(int(b) * hop + frame, len(audio))) for a, b in zip(edges[::2], edges[1::2])]
+
+
 def speech_chunks(audio: Any, sr: int = SAMPLE_RATE, max_seconds: float = MAX_CHUNK_SECONDS) -> list[tuple[int, int]]:
     """(start, end) sample ranges of at most `max_seconds`, cut in the middle of pauses."""
-    import librosa
-
     n, max_len = len(audio), int(max_seconds * sr)
     if n <= max_len:
         return [(0, n)] if n else []
@@ -81,7 +93,7 @@ def speech_chunks(audio: Any, sr: int = SAMPLE_RATE, max_seconds: float = MAX_CH
             return [(lo, hi)]
         if not top_dbs:  # no pause at all: continuous speech, cut hard
             return [(s, min(s + max_len, hi)) for s in range(lo, hi, max_len)]
-        intervals = librosa.effects.split(audio[lo:hi], top_db=top_dbs[0], frame_length=1024, hop_length=256)
+        intervals = _non_silent_intervals(audio[lo:hi], top_dbs[0])
         cuts = [lo + int(intervals[i][1] + intervals[i + 1][0]) // 2 for i in range(len(intervals) - 1)]
         out: list[tuple[int, int]] = []
         start = lo
