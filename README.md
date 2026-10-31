@@ -85,13 +85,14 @@ If a Hugging Face download hangs at 0%, run with `HF_HUB_DISABLE_XET=1`. Once do
 streamlit run app.py                       # the UI  →  http://localhost:8501
 uvicorn api.main:app --port 8000           # optional REST API  →  http://localhost:8000/docs
 pytest                                     # tests (no models needed — engines are faked)
+DVIR_OS_DIR=../dvir-os pytest              # + validate agent-run files with the real Dvir OS parser (Node)
 ```
 
 Both share the same SQLite database (`data/kolmud.db`) and lesson folders (`data/projects/lesson_<id>/`).
 
 ## Workflow
 
-1. **Sidebar → reference voice.** Upload or record 15–30 s of clean speech. Read it **in English with your best American accent** — zero-shot cloning copies pronunciation habits as well as timbre, so an English reference gives a much cleaner accent than a Hebrew one.
+1. **Sidebar → reference voice.** Upload or record 15–30 s of clean speech — the sidebar has a ready ~25 s English text to read. Read it **in English with your best American accent** — zero-shot cloning copies pronunciation habits as well as timbre, so an English reference gives a much cleaner accent than a Hebrew one. Each take is checked on save: silence at both ends is trimmed, a silent take or one with < 6 s of speech is rejected (the previous voice is kept), and short, quiet, clipped or pause-heavy takes are saved with a warning. `kolmud doctor` reports the same check.
 2. **Sidebar → new lesson.**
 3. **Studio tab.** Upload the Hebrew recording → transcribe → fix the transcript → translate. Long shiurim are split into ~1,400-character chunks (with the previous paragraph passed as continuity context), so local models with limited context work.
 4. Review each paragraph: edits save automatically. On the development branch,

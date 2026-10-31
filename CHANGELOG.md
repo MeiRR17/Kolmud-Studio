@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Reference voice check on save (UI, API `PUT /voice-profile`, `kolmud doctor`): outer silence
+  trimmed; silent takes or < 6 s of speech rejected without replacing the current voice;
+  warnings for short, long, quiet, clipped or pause-heavy takes. The sidebar offers a ready
+  ~25 s English text to read.
+- Dvir OS contract test: every agent-run report (completed and failed) is checked against a
+  mirror of `parseRun`; with a local Dvir OS checkout (`DVIR_OS_DIR`) the real parser runs too.
+- CI: actions/checkout and actions/setup-python v7 (Node 24), runner pinned to ubuntu-24.04.
+
 ## [0.2.0](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.2.0) — 2026-10-31
 
 First release validated by a real-model pilot (2:34 Hebrew shiur → master export on the
