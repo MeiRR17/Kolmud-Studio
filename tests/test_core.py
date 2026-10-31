@@ -162,3 +162,102 @@ def test_split_for_tts_respects_xtts_limit() -> None:
     assert parts[0] == "Short one." and parts[-1] == "Last!"
     assert all(len(p) <= 100 for p in parts)
     assert " ".join(parts).split() == ("Short one. " + long_sentence + " Last!").split()
+
+
+# ---------------------------------------------------------------- ASR chunking
+def _speech_with_pauses(seconds_of_speech: list[float], pause: float = 0.6, sr: int = 16000):
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    parts = []
+    for length in seconds_of_speech:
+        parts.append(0.3 * rng.standard_normal(int(length * sr)).astype("float32"))
+        parts.append(np.zeros(int(pause * sr), dtype="float32"))
+    return np.concatenate(parts)
+
+
+def test_speech_chunks_cut_inside_pauses_and_cover_everything() -> None:
+    from core.asr_whisper import speech_chunks
+
+    sr = 16000
+    audio = _speech_with_pauses([7.0] * 12)  # ~91 s of "speech" with 0.6 s pauses
+    chunks = speech_chunks(audio, sr=sr, max_seconds=25.0)
+    assert len(chunks) >= 4
+    assert all((end - start) / sr <= 25.0 for start, end in chunks)
+    assert chunks[0][0] == 0 and chunks[-1][1] == len(audio)
+    assert all(a[1] == b[0] for a, b in zip(chunks, chunks[1:]))  # contiguous: nothing skipped
+    for _, end in chunks[:-1]:  # every cut lands in silence, never mid-"word"
+        assert abs(float(audio[end])) == 0.0
+
+
+def test_speech_chunks_hard_cut_for_continuous_speech() -> None:
+    from core.asr_whisper import speech_chunks
+
+    audio = _speech_with_pauses([70.0], pause=0.0)
+    chunks = speech_chunks(audio, max_seconds=25.0)
+    assert [round((e - s) / 16000) for s, e in chunks] == [25, 25, 20]
+
+
+def test_transcribe_offsets_chunk_timestamps(monkeypatch, tmp_path) -> None:
+    import sys
+    import types
+
+    import mlx_whisper
+
+    from core import asr_whisper
+
+    audio = _speech_with_pauses([20.0, 20.0])
+    calls: list[int] = []
+
+    def fake_transcribe(chunk, **kwargs):
+        calls.append(len(chunk))
+        return {"segments": [{"start": 1.0, "end": 2.0, "text": f" part{len(calls)}",
+                              "words": [{"word": "w", "start": 1.0, "end": 1.5, "probability": 0.9}]}]}
+
+    monkeypatch.setattr(mlx_whisper, "transcribe", fake_transcribe)
+    monkeypatch.setitem(sys.modules, "mlx_whisper.audio", types.SimpleNamespace(load_audio=lambda path: audio))
+    monkeypatch.setattr(asr_whisper, "resolve_model_path", lambda repo: repo)
+    src = tmp_path / "a.wav"
+    src.write_bytes(b"x")
+    result = asr_whisper.LocalWhisperEngine("he", "en").transcribe_hebrew_lecture(src)
+    assert len(calls) == 2
+    assert result["full_text"].split() == ["part1", "part2"]
+    second = result["segments"][1]
+    assert second["start"] > 20.0  # shifted by the second chunk's offset
+
+
+# ---------------------------------------------------------------- translation prompt / schema
+def test_rule_based_coach_guide_by_default_and_llm_guide_opt_in(tmp_path: Path, lexicon: PhoneticLexicon) -> None:
+    import json as _json
+
+    from core.config import PROJECT_ROOT
+    from core.llm_translator import OllamaProvider, TorahTranslatorEngine
+
+    prompts: list[str] = []
+
+    class Recorder(OllamaProvider):
+        def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+            prompts.append(system_prompt)
+            return _json.dumps({"segments": [{"segment_id": 1, "hebrew_clean": "x",
+                                              "english_display": "Think about it on Shabbat.", "hebrew_terms": []}]})
+
+    main = PROJECT_ROOT / "prompts" / "halachic_translator.txt"
+    default = Recorder(model="m")
+    seg = TorahTranslatorEngine(default, lexicon, main).process_transcript("שבת.")[0]
+    assert "shadowing_coach_guide" not in default.schema["properties"]["segments"]["items"]["properties"]
+    assert "shadowing_coach_guide" not in prompts[-1]
+    assert seg.shadowing_coach_guide == "**THINK**_abou[d]_i[d]_on **SHABBAT**."
+
+    opted = Recorder(model="m")
+    TorahTranslatorEngine(opted, lexicon, main, coach_guide_prompt_path=PROJECT_ROOT / "prompts" / "shadowing_coach_guide.txt"
+                          ).process_transcript("שבת.")
+    assert "shadowing_coach_guide" in opted.schema["properties"]["segments"]["items"]["required"]
+    assert "BOLD CAPS" in prompts[-1]
+
+
+def test_prompt_carries_pilot_terminology_rules() -> None:
+    from core.config import PROJECT_ROOT
+
+    prompt = (PROJECT_ROOT / "prompts" / "halachic_translator.txt").read_text(encoding="utf-8")
+    assert '"לאלתר" -> "immediately"' in prompt and "Never translate it as L'chatchila" in prompt
+    assert "page 74" in prompt and "Never add editorial notes" in prompt

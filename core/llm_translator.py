@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -59,17 +59,26 @@ SEGMENTS_JSON_SCHEMA: dict = {
                             "required": ["term", "phonetic"],
                         },
                     },
-                    "shadowing_coach_guide": {"type": "string"},
                 },
-                "required": [
-                    "segment_id", "hebrew_clean", "english_display",
-                    "hebrew_terms", "shadowing_coach_guide",
-                ],
+                "required": ["segment_id", "hebrew_clean", "english_display", "hebrew_terms"],
             },
         }
     },
     "required": ["segments"],
 }
+
+
+def segments_schema(include_coach_guide: bool) -> dict:
+    """The structured-output schema; the LLM shadowing guide is an optional extra field."""
+    if not include_coach_guide:
+        return SEGMENTS_JSON_SCHEMA
+    import copy
+
+    schema = copy.deepcopy(SEGMENTS_JSON_SCHEMA)
+    item = schema["properties"]["segments"]["items"]
+    item["properties"]["shadowing_coach_guide"] = {"type": "string"}
+    item["required"].append("shadowing_coach_guide")
+    return schema
 
 
 # --------------------------------------------------------------------------- providers
@@ -99,6 +108,18 @@ class OllamaProvider:
     temperature: float = 0.2
     timeout: float = 900.0
     name: str = "ollama"
+    schema: dict = field(default_factory=lambda: SEGMENTS_JSON_SCHEMA)
+
+    def unload(self) -> None:
+        """Release the model from (GPU) memory now, whatever the server's keep_alive is.
+
+        Measured on an M1 Max: with gemma4:26b left resident, XTTS synthesis ran ~2.5x slower.
+        """
+        try:
+            with _local_aware_client(self.base_url, 30.0) as client:
+                client.post(f"{self.base_url}/api/generate", json={"model": self.model, "keep_alive": 0})
+        except httpx.HTTPError:
+            pass  # best effort; the server will evict it eventually
 
     def _supports_thinking(self, client: httpx.Client) -> bool:
         try:
@@ -113,7 +134,7 @@ class OllamaProvider:
             body: dict = {
                 "model": self.model,
                 "stream": False,
-                "format": SEGMENTS_JSON_SCHEMA,
+                "format": self.schema,
                 "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -281,15 +302,23 @@ class TorahTranslatorEngine:
         system_prompt_path: Path,
         chunk_chars: int = 1400,
         max_attempts: int = 2,
+        coach_guide_prompt_path: Path | None = None,
     ) -> None:
         self.provider = provider
         self.lexicon = lexicon
         self.system_prompt_path = Path(system_prompt_path)
         self.chunk_chars = chunk_chars
         self.max_attempts = max_attempts
+        # Without an LLM guide (the default) the guide is built by rules: in the pilot the
+        # LLM's guides matched the rule-based ones while costing ~40% of all output tokens.
+        self.coach_guide_prompt_path = Path(coach_guide_prompt_path) if coach_guide_prompt_path else None
+        if hasattr(provider, "schema"):
+            provider.schema = segments_schema(self.coach_guide_prompt_path is not None)
 
     def _system_prompt(self) -> str:
         base = self.system_prompt_path.read_text(encoding="utf-8")
+        if self.coach_guide_prompt_path is not None:
+            base = f"{base.rstrip()}\n\n{self.coach_guide_prompt_path.read_text(encoding='utf-8')}"
         entries = self.lexicon.entries()
         if not entries:
             return base

@@ -244,13 +244,21 @@ class StudioService:
     ) -> LessonOut:
         with session_scope(self.db_url) as s:
             hebrew = self._lesson(s, lesson_id).hebrew_transcript
+        provider = self.make_llm_provider(llm)
         translator = TorahTranslatorEngine(
-            provider=self.make_llm_provider(llm),
+            provider=provider,
             lexicon=self.lexicon,
             system_prompt_path=self.settings.prompt_path,
             chunk_chars=self.settings.translation_chunk_chars,
+            coach_guide_prompt_path=(
+                self.settings.coach_guide_prompt_path if self.settings.translation_llm_coach_guide else None
+            ),
         )
-        translated = translator.process_transcript(hebrew, on_progress=on_progress)
+        try:
+            translated = translator.process_transcript(hebrew, on_progress=on_progress)
+        finally:
+            if self.settings.ollama_unload_after_translation and isinstance(provider, OllamaProvider):
+                provider.unload()
 
         seg_dir = self._lesson_dir(lesson_id) / "segments"
         with session_scope(self.db_url) as s:

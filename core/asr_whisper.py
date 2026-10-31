@@ -61,6 +61,45 @@ def resolve_model_path(repo_or_path: str) -> str:
     return _RESOLVED_MODELS[repo_or_path]
 
 
+SAMPLE_RATE = 16000
+# Whisper decodes 30 s windows. When a window's last segment ends early, the rest of that
+# window is skipped — in the pilot a whole halachic condition vanished at the 30.0 s mark.
+# Transcribing pause-aligned chunks shorter than one window avoids those boundary losses.
+MAX_CHUNK_SECONDS = 25.0
+
+
+def speech_chunks(audio: Any, sr: int = SAMPLE_RATE, max_seconds: float = MAX_CHUNK_SECONDS) -> list[tuple[int, int]]:
+    """(start, end) sample ranges of at most `max_seconds`, cut in the middle of pauses."""
+    import librosa
+
+    n, max_len = len(audio), int(max_seconds * sr)
+    if n <= max_len:
+        return [(0, n)] if n else []
+
+    def split(lo: int, hi: int, top_dbs: list[int]) -> list[tuple[int, int]]:
+        if hi - lo <= max_len:
+            return [(lo, hi)]
+        if not top_dbs:  # no pause at all: continuous speech, cut hard
+            return [(s, min(s + max_len, hi)) for s in range(lo, hi, max_len)]
+        intervals = librosa.effects.split(audio[lo:hi], top_db=top_dbs[0], frame_length=1024, hop_length=256)
+        cuts = [lo + int(intervals[i][1] + intervals[i + 1][0]) // 2 for i in range(len(intervals) - 1)]
+        out: list[tuple[int, int]] = []
+        start = lo
+        while hi - start > max_len:
+            within = [c for c in cuts if start < c <= start + max_len]
+            if within:
+                out.append((start, within[-1]))
+                start = within[-1]
+            else:  # no pause this loud within reach: look for quieter pauses in this stretch
+                nxt = next((c for c in cuts if c > start), hi)
+                out.extend(split(start, nxt, top_dbs[1:]))
+                start = nxt
+        out.append((start, hi))
+        return out
+
+    return [c for c in split(0, n, [40, 30, 20]) if c[1] - c[0] >= int(0.2 * sr)]
+
+
 class LocalWhisperEngine:
     def __init__(self, hebrew_model_repo: str, english_model_repo: str) -> None:
         self.hebrew_model_repo = hebrew_model_repo
@@ -71,10 +110,24 @@ class LocalWhisperEngine:
         if not Path(audio_path).exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
         import mlx_whisper
+        from mlx_whisper.audio import load_audio
 
         kwargs["path_or_hf_repo"] = resolve_model_path(kwargs["path_or_hf_repo"])
+        import numpy as np
+
+        audio = np.asarray(load_audio(str(audio_path)), dtype=np.float32)
+        segments: list[dict[str, Any]] = []
         with _MLX_LOCK:
-            return mlx_whisper.transcribe(str(audio_path), verbose=None, **kwargs)
+            for start, end in speech_chunks(audio):
+                offset = start / SAMPLE_RATE
+                result = mlx_whisper.transcribe(audio[start:end], verbose=None, **kwargs)
+                for seg in result.get("segments", []):
+                    seg = dict(seg, start=seg["start"] + offset, end=seg["end"] + offset)
+                    seg["words"] = [dict(w, start=w["start"] + offset, end=w["end"] + offset)
+                                    for w in seg.get("words", [])]
+                    segments.append(seg)
+        text = " ".join(seg["text"].strip() for seg in segments if seg.get("text", "").strip())
+        return {"text": text, "segments": segments}
 
     def transcribe_hebrew_lecture(self, audio_path: Path, use_context_prompt: bool = False) -> HebrewTranscript:
         result = self._transcribe(
@@ -83,11 +136,9 @@ class LocalWhisperEngine:
             language="he",
             task="transcribe",
             initial_prompt=TORAH_CONTEXT_PROMPT if use_context_prompt else None,
-            word_timestamps=True,
             # Conditioning on previous text makes large-v3 prone to repetition loops on hour-long
-            # lectures; the silence threshold additionally drops hallucinations over long pauses.
+            # lectures; chunks are independent anyway.
             condition_on_previous_text=False,
-            hallucination_silence_threshold=2.0,
         )
         segments: list[TimedSegment] = [
             {"start": float(seg["start"]), "end": float(seg["end"]), "text": seg["text"].strip()}

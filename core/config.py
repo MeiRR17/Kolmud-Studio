@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # --- Storage ---
     data_dir: Path = PROJECT_ROOT / "data"
     prompt_path: Path = PROJECT_ROOT / "prompts" / "halachic_translator.txt"
+    coach_guide_prompt_path: Path = PROJECT_ROOT / "prompts" / "shadowing_coach_guide.txt"
 
     # --- ASR (mlx-whisper) ---
     hebrew_asr_model: str = "mlx-community/ivrit-ai-whisper-large-v3-turbo-mlx"
@@ -39,12 +40,16 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "gemma4:26b"
     ollama_num_ctx: int = 16384
+    # Free GPU memory for voice synthesis once a lesson is translated (reloading costs seconds).
+    ollama_unload_after_translation: bool = True
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o"
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-5-5"
     translation_chunk_chars: int = 1400
+    # Ask the LLM for the shadowing guide too (slower: ~40% more output). Off: rule-based guide.
+    translation_llm_coach_guide: bool = False
     llm_temperature: float = 0.2
     llm_timeout_seconds: float = 900.0
 

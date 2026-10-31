@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import logging
 import shutil
 import sys
 from contextlib import redirect_stdout
@@ -28,6 +29,8 @@ def main(argv=None) -> int:
     commands.add_parser("jobs", help="List persisted jobs.")
     commands.add_parser("doctor", help="Inspect local prerequisites without running inference.")
     args = parser.parse_args(argv)
+    # Engine warnings (e.g. XTTS falling back from Metal to CPU) go to stderr; stdout stays JSON.
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
 
     # --help and --version remain usable without loading model dependencies.
     from core.config import PROJECT_ROOT, Settings, detect_hardware

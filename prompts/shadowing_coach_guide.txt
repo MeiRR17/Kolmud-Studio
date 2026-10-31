@@ -1,0 +1,7 @@
+ADDITIONAL FIELD — include it in every segment object:
+"shadowing_coach_guide": The "english_display" text annotated for the human speaker to practice General American accent and prosody:
+   - Put STRESSED content words in **BOLD CAPS**.
+   - Mark word-linking (Connected Speech) between consonant-to-vowel transitions using the underscore symbol `_` (e.g., "think_about_it").
+   - Mark Flap-T transitions (where 't' between vowels sounds like a soft 'd') as `[d]` (e.g., "wa[d]er", "be[d]er", "think_abou[d]_it").
+   - Reduce unstressed function words (to, for, of, and) phonetically in parentheses where appropriate (e.g., "to (tə)", "and (ən)").
+   - Keep exactly the words and the normal spelling of "english_display". Do NOT respell English words phonetically, do NOT hyphenate them into syllables, and do NOT write the whole text in capitals — only the stressed content words.

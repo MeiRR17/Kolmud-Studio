@@ -184,3 +184,29 @@ def test_synthesis_requires_existing_voice_and_explicit_license(service, wav_byt
     with pytest.raises(WorkflowStateError, match="reference voice"):
         PipelineRunner(service).run(source, until="master")
     assert service.list_lessons() == []
+
+
+def test_narrower_job_handoff_skips_outdated_master(service, wav_bytes, tmp_path):
+    """A master left from an earlier run that is no longer verifiable must not fail an audio-only job."""
+    voice(service, wav_bytes)
+    runner = PipelineRunner(service)
+    job = runner.run(recording(tmp_path, wav_bytes), until="master")
+    master = service.get_master(job["lessonId"])
+    Path(master.srt_path).write_text("tampered", encoding="utf-8")
+
+    narrower = runner.run(job_id=job["id"], until="audio")
+    assert narrower["status"] == "NEEDS_HUMAN"
+    labels = [a["label"] for a in json.loads(Path(narrower["manifestPath"]).read_text())["assets"]]
+    assert "SRT" not in labels and any(label.startswith("Synthetic paragraph") for label in labels)
+    # Extending back to master rebuilds a fresh, verifiable generation.
+    rebuilt = runner.run(job_id=job["id"], until="master")
+    assert service.get_master(rebuilt["lessonId"]).srt_path != master.srt_path
+
+
+def test_undecodable_recording_gets_actionable_message(service, tmp_path):
+    broken = tmp_path / "broken.wav"
+    broken.write_text("not audio")
+    with pytest.raises(PipelineRunError) as info:
+        PipelineRunner(service).run(broken)
+    assert info.value.job["errorType"] == "AudioToolError"
+    assert "valid audio file" in info.value.job["errorMessage"]

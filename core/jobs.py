@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from typing import Callable
 
 from core import __version__
+from core.audio_utils import AudioToolError
 from core.pipeline import StudioService, WorkflowStateError, file_digest
 from core.runtime import PipelineBusyError, file_lock
 
@@ -141,7 +142,12 @@ class PipelineRunner:
             except Exception as exc:
                 # Never put raw model replies, credentials, or HTTP error bodies
                 # in review files. The exception class and stage identify failure.
-                message = str(exc) if isinstance(exc, (WorkflowStateError, PipelineBusyError, FileNotFoundError)) else "Engine execution failed; retry or inspect the provider locally."
+                if isinstance(exc, (WorkflowStateError, PipelineBusyError, FileNotFoundError)):
+                    message = str(exc)
+                elif isinstance(exc, AudioToolError):
+                    message = "The recording could not be decoded; check that it is a valid audio file."
+                else:
+                    message = "Engine execution failed; retry or inspect the provider locally."
                 job.update(status="FAILED", errorType=type(exc).__name__, errorMessage=message, finishedAt=now())
                 self._save(job)
                 try:
@@ -213,7 +219,9 @@ class PipelineRunner:
             path = svc.abs_path(seg.audio_path)
             if path is None or not path.is_file() or seg.audio_is_stale:
                 svc.synthesize_segment(seg.id)
-                job["models"]["synthesis"] = "XTTS-v2"
+                # Record where synthesis really ran: a silent MPS->CPU fallback is ~5x slower.
+                device = getattr(svc.make_tts_engine(), "device", None)
+                job["models"]["synthesis"] = f"XTTS-v2 ({device})" if device else "XTTS-v2"
                 job["steps"].append({"tool": "XTTS-v2", "detail": f"Generated paragraph {seg.position}.", "at": now()})
                 self._save(job)
         self._complete(job, "audio")
@@ -277,9 +285,16 @@ class PipelineRunner:
                     if path and path.is_file() and not seg.audio_is_stale:
                         asset(f"Synthetic paragraph {seg.position}", path)
             if lesson.master_audio_path and job["status"] != "FAILED":
-                master = self.service.get_master(lesson.id)
-                for kind in ("wav", "mp3", "srt"):
-                    asset(kind.upper(), Path(getattr(master, f"{kind}_path")))
+                # A master left over from an earlier, broader run may no longer be current;
+                # list only a verified one instead of failing a narrower (e.g. audio) job.
+                try:
+                    master = self.service.get_master(lesson.id)
+                except WorkflowStateError:
+                    if job["until"] == "master":
+                        raise
+                else:
+                    for kind in ("wav", "mp3", "srt"):
+                        asset(kind.upper(), Path(getattr(master, f"{kind}_path")))
         checks = [
             {"name": "Requested processing stage", "status": "fail" if job["status"] == "FAILED" else "pass",
              "detail": f"Requested: {job['until']}; last stage: {job['stage']}; error: {job.get('errorMessage') or 'none'}."},

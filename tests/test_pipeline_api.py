@@ -82,3 +82,33 @@ def test_api_endpoints(service: StudioService, wav_bytes: bytes) -> None:
         assert client.get("/lessons/9999").status_code == 404
     finally:
         app.dependency_overrides.clear()
+
+
+def test_ollama_model_is_unloaded_after_translation_even_on_failure(service, monkeypatch) -> None:
+    from core.llm_translator import OllamaProvider, TranslationError
+
+    unloaded: list[str] = []
+
+    class FakeOllama(OllamaProvider):
+        def __init__(self, fail: bool) -> None:
+            super().__init__(model="gemma4:26b")
+            self.fail = fail
+
+        def complete_json(self, system_prompt: str, user_prompt: str) -> str:
+            if self.fail:
+                raise TranslationError("boom")
+            return service.fake_provider.complete_json(system_prompt, user_prompt)  # type: ignore[attr-defined]
+
+        def unload(self) -> None:
+            unloaded.append(self.model)
+
+    lesson = service.create_lesson("unload")
+    service.set_transcript(lesson.id, "נחלקו הראשונים.")
+    monkeypatch.setattr(service, "make_llm_provider", lambda choice=None: FakeOllama(fail=False))
+    service.translate(lesson.id)
+    monkeypatch.setattr(service, "make_llm_provider", lambda choice=None: FakeOllama(fail=True))
+    try:
+        service.translate(lesson.id)
+    except TranslationError:
+        pass
+    assert unloaded == ["gemma4:26b", "gemma4:26b"]
