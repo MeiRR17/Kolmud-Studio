@@ -5,6 +5,7 @@ Run:  uvicorn api.main:app --reload --port 8000     ·  docs at http://localhost
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -14,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from core import __version__
-from core.audio_utils import AudioToolError
+from core.audio_utils import VOICE_CHECK_MESSAGES, AudioToolError
 from core.config import detect_hardware, get_settings
 from core.llm_translator import TranslationError, list_ollama_models
 from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, WorkflowStateError
@@ -101,8 +102,9 @@ def health(svc: Service) -> dict:
 
 @app.put("/voice-profile")
 async def upload_reference_voice(svc: Service, file: UploadFile = File(...)) -> dict:
-    path = svc.save_reference_voice(file.filename or "voice.wav", await file.read())
-    return {"reference_voice_path": str(path)}
+    check = svc.save_reference_voice(file.filename or "voice.wav", await file.read())
+    return {"reference_voice_path": str(svc.settings.reference_voice_path), "check": asdict(check),
+            "warnings": [VOICE_CHECK_MESSAGES[code] for code in check.warnings]}
 
 
 # ---------------------------------------------------------------- lessons

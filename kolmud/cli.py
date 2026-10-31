@@ -57,6 +57,11 @@ def main(argv=None) -> int:
                           "ffmpeg": bool(shutil.which("ffmpeg")), "ollamaModelInstalled": settings.ollama_model in models,
                           "cliLocalPolicy": settings.llm_provider == "ollama" and loopback_url(settings.ollama_base_url) and settings.tts_engine == "xtts",
                           "referenceVoiceExists": settings.reference_voice_path.is_file(), "xttsLicenseAccepted": settings.xtts_accept_cpml}
+                if settings.reference_voice_path.is_file():
+                    from dataclasses import asdict
+
+                    from core.audio_utils import check_and_trim_voice
+                    result["referenceVoiceCheck"] = asdict(check_and_trim_voice(settings.reference_voice_path))
             else:
                 runner = PipelineRunner(StudioService(settings))
                 started = lambda job_id: print(f"Job ID: {job_id} (resume with: kolmud resume {job_id})", file=sys.stderr)

@@ -12,10 +12,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core import __version__
+from core import __version__, audio_utils
 from core.config import detect_hardware, get_settings
 from core.llm_translator import list_ollama_models
-from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice
+from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, VoiceRejectedError
 from core.schemas import AttemptOut, LessonOut, SegmentOut, SegmentUpdate
 
 st.set_page_config(page_title=f"Kolmud Studio v{__version__}", page_icon="🎙️", layout="wide", initial_sidebar_state="expanded")
@@ -66,6 +66,27 @@ def ollama_models(base_url: str) -> list[str]:
 
 svc = get_service()
 settings = svc.settings
+
+VOICE_MESSAGES_HE = {
+    "silent": "ההקלטה שקטה לגמרי — בדוק שהמיקרופון הנכון נבחר.",
+    "too_short": "פחות מ-6 שניות דיבור. XTTS צריך לפחות 6 (מומלץ 15–30).",
+    "short": "פחות מ-12 שניות דיבור — 15–30 שניות ישכפלו את הקול נאמנה יותר.",
+    "long": "מעל 60 שניות — רק 60 השניות הראשונות ישמשו.",
+    "pauses": "יותר ממחצית ההקלטה שקט — דבר ברצף.",
+    "quiet": "ההקלטה שקטה מאוד — התקרב למיקרופון.",
+    "clipping": "יש עיוות (clipping) — הנמך את עוצמת הקלט או התרחק מעט.",
+}
+REFERENCE_SCRIPT = (
+    "Good morning, and thank you for joining today's class. We're going to look at a short idea "
+    "from the weekly portion, and I think you'll find it really thought-provoking. Let's begin "
+    "with a simple question: what does it actually mean to rest? Take a moment to think about it, "
+    "and then we'll explore the answer together, step by step."
+)
+
+
+@st.cache_data(max_entries=4)
+def voice_check(path: str, mtime: float) -> audio_utils.VoiceCheck:  # mtime: cache key
+    return audio_utils.check_and_trim_voice(Path(path))
 
 
 # ======================================================================== rendering helpers
@@ -170,19 +191,26 @@ with st.sidebar:
             st.warning("XTTS-v2 דורש אישור רישיון CPML (לא-מסחרי): הגדר `XTTS_ACCEPT_CPML=true` בקובץ `.env`.")
         ref = settings.reference_voice_path
         if ref.exists():
-            st.success("דגימת קול ייחוס קיימת ✅")
+            check = voice_check(str(ref), ref.stat().st_mtime)
+            st.success(f"דגימת קול ייחוס קיימת ✅ · {check.speech_seconds:.0f} שניות דיבור")
+            for code in check.warnings:
+                st.warning(VOICE_MESSAGES_HE[code])
             st.audio(str(ref))
         else:
             st.info("נדרשת דגימת קול ייחוס (15–30 שניות, חדר שקט).")
         st.caption("💡 טיפ: הקלט את הדגימה **באנגלית**, במבטא האמריקאי הטוב ביותר שלך — המודל מעתיק גם את ההגייה.")
+        with st.expander("📜 טקסט מוכן להקראה (כ-25 שניות)"):
+            st.markdown(f'<div class="ltr">{html.escape(REFERENCE_SCRIPT)}</div>', unsafe_allow_html=True)
         ref_upload = st.file_uploader("העלה דגימה (WAV/MP3/M4A):", type=["wav", "mp3", "m4a", "flac"], key="ref_upload")
         ref_record = st.audio_input("או הקלט כאן:", key="ref_record")
         if st.button("שמור כדגימת ייחוס", disabled=not (ref_upload or ref_record)):
             src = ref_upload or ref_record
             try:
                 svc.save_reference_voice(getattr(src, "name", "voice.wav"), src.getvalue())
-                st.success("דגימת הקול נשמרה.")
                 st.rerun()
+            except VoiceRejectedError as exc:
+                st.error("הדגימה לא נשמרה (הדגימה הקודמת נשארה): " + " ".join(
+                    VOICE_MESSAGES_HE[c] for c in exc.check.errors))
             except Exception as exc:  # noqa: BLE001
                 show_error(exc)
 

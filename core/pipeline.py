@@ -45,6 +45,15 @@ class WorkflowStateError(RuntimeError):
     """Inputs changed or required outputs are missing; further processing is unsafe."""
 
 
+class VoiceRejectedError(WorkflowStateError):
+    """The reference recording can't be used for cloning; the previous one is kept."""
+
+    def __init__(self, check: audio_utils.VoiceCheck) -> None:
+        self.check = check
+        super().__init__("Reference voice rejected: " + " ".join(
+            audio_utils.VOICE_CHECK_MESSAGES[code] for code in check.errors))
+
+
 def file_digest(path: Path) -> str:
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
@@ -408,17 +417,32 @@ class StudioService:
 
     # ------------------------------------------------------------------ voice profile
     @exclusive_inference
-    def save_reference_voice(self, filename: str, data: bytes) -> Path:
-        """Store the cloning reference as 24 kHz mono WAV, whatever format it arrived in."""
+    def save_reference_voice(self, filename: str, data: bytes) -> audio_utils.VoiceCheck:
+        """Check and store the cloning reference as 24 kHz mono WAV, outer silence trimmed.
+
+        An unusable recording (silent, < 6 s of speech) is rejected and the current
+        reference voice is kept; a usable one with issues is saved with warnings.
+        """
         dst = self.settings.reference_voice_path
         dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_name(f"upload{Path(filename).suffix or '.wav'}")
-        tmp.write_bytes(data)
+        stem = uuid.uuid4().hex
+        upload = dst.with_name(f".upload-{stem}{Path(filename).suffix or '.wav'}")
+        converted, trimmed = dst.with_name(f".converted-{stem}.wav"), dst.with_name(f".trimmed-{stem}.wav")
+        upload.write_bytes(data)
         try:
-            audio_utils.to_wav(tmp, dst, sample_rate=24000)
+            audio_utils.to_wav(upload, converted, sample_rate=24000)
+            check = audio_utils.check_and_trim_voice(converted, trimmed)
+            if not check.ok:
+                raise VoiceRejectedError(check)
+            trimmed.replace(dst)
+            return check
         finally:
-            tmp.unlink(missing_ok=True)
-        return dst
+            for tmp in (upload, converted, trimmed):
+                tmp.unlink(missing_ok=True)
+
+    def reference_voice_check(self) -> audio_utils.VoiceCheck | None:
+        path = self.settings.reference_voice_path
+        return audio_utils.check_and_trim_voice(path) if path.is_file() else None
 
     # ------------------------------------------------------------------ practice lab
     def _evaluator(self) -> AccentAndFluencyEvaluator:
