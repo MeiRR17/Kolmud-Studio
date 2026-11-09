@@ -33,3 +33,15 @@ Use as small title/overlay renderer, not replace a complete NLE or audio engine.
 - [ ] קוד או ניסוי השוואתי ותוצאות מדודות
 - [ ] בדיקות יחידה, אינטגרציה, קצה ורגרסיה
 - [ ] תיעוד הפעלה, ניטור, rollback וקישור ל־PR בעל ראיות
+
+## מימוש ראשוני שהועלה בענף זה
+
+קיים כעת `scripts/hyperframes_local_render.py` — מתאם אופציונלי שמפעיל **רק בינארי HyperFrames שכבר הותקן**, על פרויקט מקומי ומורשה *מחוץ* ל־Git. ברירת המחדל היא plan בלבד; `--run` מפעיל `hyperframes render`. הקוד אינו מריץ `npx`, אינו מתקין תלויות ואינו מפרסם סרטונים.
+
+```sh
+python3 scripts/hyperframes_local_render.py --project /path/to/approved-original-video
+python3 scripts/hyperframes_local_render.py --project /path/to/approved-original-video --run
+python3 -m unittest discover -s tests -p test_hyperframes_local_render.py -v
+```
+
+בדיקות יחידה משתמשות ב־runner מדומה. לא בוצע רינדור MP4 אמיתי או אימות זכויות של הנכסים. לפני הפעלה ב־Mac יש לוודא רישיון תוכנה ותוכן, מקור הפרויקט, גרסת Node 22+, ffmpeg ויצוא MP4 מדויק. יש להפעיל חסימת רשת ברמת OS אם לא רוצים אפשרות גישה לרשת — סינון environment בלבד אינו מהווה sandbox.
