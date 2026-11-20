@@ -369,6 +369,34 @@ class TorahTranslatorEngine:
         if on_progress:
             on_progress(len(chunks), len(chunks))
 
+        return self._finalize(results)
+
+    def process_source_cues(self, texts: list[str], on_progress: ProgressCallback | None = None) -> list[TranslatedSegment]:
+        """One output per source anchor, regardless of model-produced segmentation."""
+        system_prompt = self._system_prompt()
+        results = []
+        for idx, source in enumerate(texts):
+            if not source.strip():
+                raise TranslationError("A source cue has no text.")
+            if on_progress:
+                on_progress(idx, len(texts))
+            pieces = []
+            previous = results[-1].english_display[-1400:] if results else ""
+            for chunk in chunk_hebrew_text(source, self.chunk_chars):
+                parts = self._translate_chunk(system_prompt, chunk, previous)
+                pieces.extend(parts)
+                previous = parts[-1].english_display[-1400:]
+            results.append(TranslatedSegment(
+                hebrew_clean=source,
+                english_display=" ".join(piece.english_display for piece in pieces),
+                hebrew_terms=[term for piece in pieces for term in piece.hebrew_terms],
+                shadowing_coach_guide=" ".join(piece.shadowing_coach_guide for piece in pieces),
+            ))
+        if on_progress:
+            on_progress(len(texts), len(texts))
+        return self._finalize(results)
+
+    def _finalize(self, results: list[TranslatedSegment]) -> list[TranslatedSegment]:
         for number, seg in enumerate(results, start=1):
             seg.segment_id = number
             # Keep only terms that really occur in the text (models sometimes invent extras).

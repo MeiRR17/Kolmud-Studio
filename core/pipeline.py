@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import shutil
 import threading
 import uuid
@@ -19,10 +20,12 @@ from typing import Callable
 from sqlalchemy import select
 
 from core import audio_utils
+from core import __version__
+from core.artifacts import private_json
 from core.accent_evaluator import AccentAndFluencyEvaluator, normalize_text
 from core.asr_whisper import LocalWhisperEngine
 from core.config import Settings
-from core.database import Lesson, PracticeAttempt, Segment, session_scope
+from core.database import Lesson, PracticeAttempt, Segment, SourceCue, session_scope
 from core.lexicon import PhoneticLexicon, clean_for_tts
 from core.llm_translator import (
     AnthropicProvider,
@@ -32,6 +35,9 @@ from core.llm_translator import (
     TorahTranslatorEngine,
 )
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
+from core.schemas import SourceCaptionOutputs, SourceCueOut, SourceCueUpdate, SourceTimelineOut
+from core.schemas import DubbingPlan, SynchronizedOutputs
+from core.source_timing import cue_flags, normalized, source_records, validate_interval, write_anchored_srt
 from core.prosody import add_content_word_stress, auto_coach_guide
 from core.runtime import exclusive_inference
 from core.tts_cloner import ElevenLabsVoiceCloner, TTSEngine, TTSError, XTTSVoiceCloner
@@ -210,8 +216,11 @@ class StudioService:
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
             lesson.source_audio_path = self._rel(wav)
+            lesson.source_asset = {"original_path": self._rel(original), "original_sha256": file_digest(original),
+                                   "normalized_sha256": file_digest(wav)}
             lesson.hebrew_transcript = ""
             lesson.asr_segments = None
+            lesson.timeline_revision = None
             lesson.translation_source_text = None
             self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
@@ -222,15 +231,29 @@ class StudioService:
             source = self.abs_path(self._lesson(s, lesson_id).source_audio_path)
         if source is None or not source.exists():
             raise FileNotFoundError("Upload the Hebrew lecture audio first.")
+        source_hash = file_digest(source)
         result = self.asr.transcribe_hebrew_lecture(
             source, use_context_prompt=self.settings.hebrew_asr_context_prompt
         )
+        if file_digest(source) != source_hash:
+            raise WorkflowStateError("Source audio changed during transcription; retry.")
+        try:
+            records = source_records(list(result["segments"]), audio_utils.duration_seconds(source))
+        except (ValueError, KeyError, TypeError) as exc:
+            raise WorkflowStateError("ASR returned invalid source timestamps; review or retry transcription.") from exc
         with session_scope(self.db_url) as s:
             lesson = self._lesson(s, lesson_id)
             if self.abs_path(lesson.source_audio_path) != source:
                 raise WorkflowStateError("Source audio changed during transcription; retry the current recording.")
             lesson.hebrew_transcript = result["full_text"]
             lesson.asr_segments = list(result["segments"])
+            lesson.timeline_revision = uuid.uuid4().hex
+            for position, record in enumerate(records, start=1):
+                lesson.source_cues.append(SourceCue(
+                    revision=lesson.timeline_revision, position=position,
+                    source_audio_path=lesson.source_audio_path, source_audio_sha256=source_hash, **record,
+                ))
+            s.flush()
             self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
 
@@ -239,9 +262,153 @@ class StudioService:
             lesson = self._lesson(s, lesson_id)
             if lesson.hebrew_transcript != text:
                 lesson.hebrew_transcript = text
-                lesson.asr_segments = None
+                # Keep the original ASR evidence; arbitrary full-text edits make
+                # its timeline stale until the source cues are explicitly edited.
                 self._invalidate_master(lesson)
             return LessonOut.model_validate(lesson)
+
+    # --------------------------------------------------- source-time review/captions
+    def _source_snapshot(self, lesson: Lesson) -> str:
+        cues = lesson.current_source_cues
+        if not cues or lesson.source_timeline_is_stale:
+            raise WorkflowStateError("Current source cues are missing or differ from the transcript; review the source timeline first.")
+        source = self.abs_path(lesson.source_audio_path)
+        if source is None or not source.is_file():
+            raise WorkflowStateError("The original source recording is missing.")
+        digest = file_digest(source)
+        if lesson.source_asset:
+            if digest != lesson.source_asset["normalized_sha256"]:
+                raise WorkflowStateError("The normalized source changed after import; import the intended recording again.")
+            original = self.abs_path(lesson.source_asset["original_path"])
+            if original is None or not original.is_file() or file_digest(original) != lesson.source_asset["original_sha256"]:
+                raise WorkflowStateError("The original media file is missing or changed after import.")
+        if any(cue.source_audio_path != lesson.source_audio_path or cue.source_audio_sha256 != digest for cue in cues):
+            raise WorkflowStateError("The recording changed after transcription; transcribe the current source.")
+        duration = audio_utils.duration_seconds(source)
+        previous_end = 0.0
+        for cue in cues:
+            try:
+                validate_interval(cue.start, cue.end, duration)
+            except ValueError as exc:
+                raise WorkflowStateError(str(exc)) from exc
+            if cue.start < previous_end - 0.0001:
+                raise WorkflowStateError("Overlapping source cues require timing correction.")
+            previous_end = cue.end
+        payload = [lesson.timeline_revision, digest, lesson.source_asset,
+                   [[cue.id, cue.edit_version, cue.start, cue.end, cue.text] for cue in cues]]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+
+    def get_source_timeline(self, lesson_id: int) -> SourceTimelineOut:
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            flags = []
+            try:
+                self._source_snapshot(lesson)
+            except WorkflowStateError as exc:
+                flags.append(str(exc))
+            cues = []
+            previous_end = 0.0
+            for cue in lesson.current_source_cues:
+                out = SourceCueOut.model_validate(cue)
+                out.flags = cue_flags(cue)
+                if cue.start < previous_end - 0.0001:
+                    out.flags.append("overlapping_source_cues")
+                previous_end = cue.end
+                cues.append(out)
+            return SourceTimelineOut(lesson_id=lesson.id, revision=lesson.timeline_revision,
+                                     stale=bool(flags), flags=flags, cues=cues,
+                                     pending_review=sum(not cue.reviewed for cue in cues))
+
+    def update_source_cue(self, cue_id: int, update: SourceCueUpdate) -> SourceCueOut:
+        with session_scope(self.db_url) as s:
+            # Serialize cue edits before checking versions and rebuilding the
+            # lesson text so two different cue edits cannot overwrite each other.
+            s.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            cue = s.get(SourceCue, cue_id)
+            if cue is None:
+                raise NotFoundError(f"Source cue {cue_id} not found")
+            lesson = cue.lesson
+            if cue.revision != lesson.timeline_revision:
+                raise WorkflowStateError("Historical source cues are read-only.")
+            if lesson.source_timeline_is_stale:
+                raise WorkflowStateError("Full-text edits differ from the source cues; restore the matching text or transcribe again before cue editing.")
+            if cue.edit_version != update.expected_version:
+                raise WorkflowStateError("This cue was edited elsewhere; reload its current version.")
+            changes = update.model_dump(exclude_none=True, exclude={"expected_version"})
+            start, end = changes.get("start", cue.start), changes.get("end", cue.end)
+            source = self.abs_path(lesson.source_audio_path)
+            if source is None or not source.is_file() or cue.source_audio_sha256 != file_digest(source):
+                raise WorkflowStateError("The source recording is missing or changed.")
+            try:
+                validate_interval(start, end, audio_utils.duration_seconds(source))
+            except ValueError as exc:
+                raise WorkflowStateError(str(exc)) from exc
+            cues = lesson.current_source_cues
+            index = next(i for i, current in enumerate(cues) if current.id == cue_id)
+            if (index and start < cues[index - 1].end - 0.0001) or (index + 1 < len(cues) and end > cues[index + 1].start + 0.0001):
+                raise WorkflowStateError("Edited timing overlaps a neighboring source cue.")
+            before = {"text": cue.text, "start": cue.start, "end": cue.end, "reviewed": cue.reviewed}
+            content_changed = any(key in changes and changes[key] != before[key] for key in ("text", "start", "end"))
+            text_changed = "text" in changes and changes["text"] != before["text"]
+            for key, value in changes.items():
+                setattr(cue, key, value)
+            if content_changed:
+                cue.timing_basis = "manual_segment"
+                cue.reviewed = changes.get("reviewed", False)
+                if text_changed:
+                    lesson.hebrew_transcript = "\n\n".join(current.text for current in cues)
+                self._invalidate_master(lesson)
+            cue.edit_version += 1
+            cue.edits = [*cue.edits, {"at": datetime.now(timezone.utc).isoformat(), "before": before,
+                                     "after": {"text": cue.text, "start": cue.start, "end": cue.end,
+                                               "reviewed": cue.reviewed}}]
+            s.flush()
+            out = SourceCueOut.model_validate(cue)
+            out.flags = cue_flags(cue)
+            return out
+
+    def build_source_captions(self, lesson_id: int, include_english: bool = True) -> SourceCaptionOutputs:
+        """Draft captions on the original timeline, distinct from dubbed-audio SRT."""
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            signature = self._source_snapshot(lesson)
+            source_cues = lesson.current_source_cues
+            translations = {}
+            if include_english:
+                self._require_current_translation(lesson)
+                if len(lesson.segments) != len(source_cues) or {seg.source_cue_id for seg in lesson.segments} != {cue.id for cue in source_cues}:
+                    raise WorkflowStateError("Translate with source_timed=true to obtain explicit source-to-English links.")
+                translations = {seg.source_cue_id: seg.english_display for seg in lesson.segments}
+                if any(not text.strip() for text in translations.values()):
+                    raise WorkflowStateError("A source cue has an empty English translation.")
+            snapshots = [{**SourceCueOut.model_validate(cue).model_dump(), "flags": cue_flags(cue),
+                          "english_text": translations.get(cue.id)} for cue in source_cues]
+            pending = sum(not cue.reviewed for cue in source_cues)
+            revision = lesson.timeline_revision
+            source_path = lesson.source_audio_path
+        directory = self._lesson_dir(lesson_id) / "source_captions" / uuid.uuid4().hex
+        he = write_anchored_srt([(cue["start"], cue["end"], cue["text"]) for cue in snapshots], directory / "source.he.srt")
+        en = (write_anchored_srt([(cue["start"], cue["end"], cue["english_text"]) for cue in snapshots], directory / "source.en.srt")
+              if include_english else None)
+        # Recheck before handing a generation to the caller. Partial generations
+        # stay unreferenced and never become a current publication candidate.
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            if self._source_snapshot(lesson) != signature or (include_english and (
+                lesson.translation_is_stale or {seg.source_cue_id: seg.english_display for seg in lesson.segments} != translations
+            )):
+                raise WorkflowStateError("Source/translation changed during caption export; rebuild it.")
+        manifest = directory / "manifest.json"
+        private_json(manifest, {"schemaVersion": 1, "producer": "Kolmud Studio", "version": __version__,
+                               "lessonId": lesson_id, "timelineRevision": revision, "sourceSnapshot": signature,
+                               "sourceAudioPath": source_path, "timeline": "original_source",
+                               "timingPrecision": "segment_anchors_not_forced_alignment", "cues": snapshots,
+                               "sourcePendingReview": pending, "translationReview": "not_recorded" if en else "not_applicable",
+                               "publicationReady": False,
+                               "files": [{"path": str(path), "sha256": file_digest(path)} for path in (he, en) if path]})
+        return SourceCaptionOutputs(hebrew_srt_path=str(he), english_srt_path=str(en) if en else None,
+                                    manifest_path=str(manifest), timeline_revision=revision,
+                                    source_cue_count=len(snapshots), pending_review=pending)
 
     # ------------------------------------------------------------------ step 2: translation
     @exclusive_inference
@@ -250,9 +417,14 @@ class StudioService:
         lesson_id: int,
         llm: LLMChoice | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        source_timed: bool = False,
     ) -> LessonOut:
         with session_scope(self.db_url) as s:
-            hebrew = self._lesson(s, lesson_id).hebrew_transcript
+            lesson = self._lesson(s, lesson_id)
+            hebrew = lesson.hebrew_transcript
+            source_snapshot = self._source_snapshot(lesson) if source_timed else None
+            source_texts = [cue.text for cue in lesson.current_source_cues] if source_timed else []
+            source_ids = [cue.id for cue in lesson.current_source_cues] if source_timed else []
         provider = self.make_llm_provider(llm)
         translator = TorahTranslatorEngine(
             provider=provider,
@@ -264,7 +436,8 @@ class StudioService:
             ),
         )
         try:
-            translated = translator.process_transcript(hebrew, on_progress=on_progress)
+            translated = (translator.process_source_cues(source_texts, on_progress=on_progress) if source_timed
+                          else translator.process_transcript(hebrew, on_progress=on_progress))
         finally:
             if self.settings.ollama_unload_after_translation and isinstance(provider, OllamaProvider):
                 provider.unload()
@@ -274,10 +447,12 @@ class StudioService:
             lesson = self._lesson(s, lesson_id)
             if lesson.hebrew_transcript != hebrew:
                 raise WorkflowStateError("The transcript changed during translation; retry with the current text.")
+            if source_timed and self._source_snapshot(lesson) != source_snapshot:
+                raise WorkflowStateError("Source timing changed during translation; retry.")
             lesson.segments.clear()  # cascades; practice history belongs to the old segments
             self._invalidate_master(lesson)
             lesson.translation_source_text = hebrew
-            for t in translated:
+            for index, t in enumerate(translated):
                 lesson.segments.append(Segment(
                     position=t.segment_id,
                     hebrew_clean=t.hebrew_clean,
@@ -285,6 +460,7 @@ class StudioService:
                     english_tts_phonetic=t.english_tts_phonetic,
                     shadowing_coach_guide=t.shadowing_coach_guide,
                     hebrew_terms=[term.model_dump() for term in t.hebrew_terms],
+                    source_cue_id=source_ids[index] if source_timed else None,
                 ))
             s.flush()
             out = LessonOut.model_validate(lesson)
@@ -338,8 +514,124 @@ class StudioService:
             seg.audio_path = self._rel(out)
             seg.audio_duration = audio_utils.duration_seconds(out)
             seg.audio_source_text = text
+            seg.audio_origin = "synthetic"
             self._invalidate_master(seg.lesson)
             return SegmentOut.model_validate(seg)
+
+    @exclusive_inference
+    def attach_segment_recording(self, segment_id: int, filename: str, data: bytes) -> SegmentOut:
+        with session_scope(self.db_url) as s:
+            seg = self._segment(s, segment_id)
+            self._require_current_translation(seg.lesson)
+            text, lesson_id = seg.english_display, seg.lesson_id
+        directory = self._lesson_dir(lesson_id) / "segments" / f"recorded_{segment_id}_{uuid.uuid4().hex}"
+        directory.mkdir(parents=True, exist_ok=True)
+        original = directory / f"original{Path(filename).suffix.lower() or '.bin'}"
+        original.write_bytes(data)
+        audio = audio_utils.to_wav(original, directory / "english.wav", sample_rate=24000)
+        duration = audio_utils.duration_seconds(audio)
+        if duration <= 0:
+            raise WorkflowStateError("The English recording is empty.")
+        import numpy as np
+        import soundfile as sf
+        samples, _ = sf.read(audio, dtype="float32")
+        if not np.any(np.abs(samples) > 1e-5):
+            raise WorkflowStateError("The English recording contains no audible signal.")
+        with session_scope(self.db_url) as s:
+            seg = self._segment(s, segment_id)
+            self._require_current_translation(seg.lesson)
+            if seg.english_display != text:
+                raise WorkflowStateError("The English text changed during upload; check and upload again.")
+            seg.audio_path, seg.audio_duration = self._rel(audio), duration
+            seg.audio_source_text, seg.audio_origin = text, "recorded"
+            self._invalidate_master(seg.lesson)
+            return SegmentOut.model_validate(seg)
+
+    def get_dubbing_plan(self, lesson_id: int, max_speed: float = 1.15) -> DubbingPlan:
+        if not math.isfinite(max_speed) or not 1 <= max_speed <= 1.25:
+            raise WorkflowStateError("Maximum dubbing speed must be between 1.0 and 1.25.")
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            snapshot = self._source_snapshot(lesson)
+            self._require_current_translation(lesson)
+            cues = lesson.current_source_cues
+            source_duration = audio_utils.duration_seconds(self.abs_path(lesson.source_audio_path))
+            by_cue = {seg.source_cue_id: seg for seg in lesson.segments}
+            if len(lesson.segments) != len(cues) or set(by_cue) != {cue.id for cue in cues}:
+                raise WorkflowStateError("Source-timed translation is required before synchronized dubbing.")
+            segments = []
+            for cue in cues:
+                seg = by_cue[cue.id]
+                path = self.abs_path(seg.audio_path)
+                status, duration, digest = "ready", None, None
+                tempo = 1.0
+                if path is None or not path.is_file():
+                    status = "missing_audio"
+                elif seg.audio_is_stale:
+                    status = "stale_audio"
+                else:
+                    duration, digest = audio_utils.duration_seconds(path), file_digest(path)
+                    window = cue.end - cue.start
+                    if duration <= 0:
+                        status = "empty_audio"
+                    elif duration > window:
+                        # Small headroom absorbs the atempo filter's rounding;
+                        # the renderer still refuses to trim any overrun.
+                        required_speed = duration / window
+                        tempo = min(max_speed, required_speed * 1.01)
+                        if required_speed > max_speed:
+                            status = "too_long"
+                if cue.end > source_duration:
+                    status = "source_window_out_of_range"
+                segments.append({"segment_id": seg.id, "source_cue_id": cue.id, "position": cue.position,
+                                 "start": cue.start, "end": cue.end, "english_text": seg.english_display,
+                                 "audio_path": str(path) if path else None, "audio_sha256": digest,
+                                 "audio_origin": seg.audio_origin or "synthetic", "audio_duration": duration,
+                                 "tempo": tempo, "status": status})
+            duration = source_duration
+            original = self.abs_path(lesson.source_asset["original_path"]) if lesson.source_asset else None
+            video = str(original) if original and original.suffix.lower() in {".mp4", ".mov", ".m4v"} else None
+            return DubbingPlan(lesson_id=lesson_id, source_snapshot=snapshot, duration_seconds=duration,
+                               max_speed=max_speed, ready=all(seg["status"] == "ready" for seg in segments),
+                               segments=segments, original_video_path=video)
+
+    @exclusive_inference
+    def build_synchronized_audio(self, lesson_id: int, max_speed: float = 1.15) -> SynchronizedOutputs:
+        from core.dubbing import render_track
+
+        plan = self.get_dubbing_plan(lesson_id, max_speed)
+        if not plan.ready:
+            blocked = [(seg["position"], seg["status"]) for seg in plan.segments if seg["status"] != "ready"]
+            raise WorkflowStateError(f"Dubbing needs correction before rendering: {blocked}.")
+        directory = self._lesson_dir(lesson_id) / "synchronized" / uuid.uuid4().hex
+        wav = directory / "source_synced.en.wav"
+        try:
+            placements = render_track(plan.segments, plan.duration_seconds, wav)
+        except ValueError as exc:
+            raise WorkflowStateError(str(exc)) from exc
+        mp3 = audio_utils.wav_to_mp3(wav, directory / "source_synced.en.mp3")
+        captions = write_anchored_srt([(seg["start"], seg["end"], seg["english_text"]) for seg in plan.segments],
+                                      directory / "source_synced.en.srt")
+        video = None
+        if plan.original_video_path:
+            video = directory / "source_synced.en.mp4"
+            # Copy the original video frames unchanged. Do not use -shortest,
+            # which could silently discard a silent video tail.
+            audio_utils._run([audio_utils._ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
+                              "-i", plan.original_video_path, "-i", str(wav), "-map", "0:v:0", "-map", "1:a:0",
+                              "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", str(video)])
+        if self.get_dubbing_plan(lesson_id, max_speed) != plan:
+            raise WorkflowStateError("Source or English audio changed during synchronized rendering; rebuild it.")
+        manifest = directory / "manifest.json"
+        private_json(manifest, {"schemaVersion": 1, "lessonId": lesson_id, "timeline": "original_source",
+                               "sourceSnapshot": plan.source_snapshot, "maxSpeed": max_speed,
+                               "durationSeconds": plan.duration_seconds, "placements": placements,
+                               "inputSegments": plan.segments, "publicationReady": False,
+                               "qualityReview": "required", "fullRecordingForcedAlignment": "not_implemented",
+                               "files": [{"path": str(path), "sha256": file_digest(path)} for path in (wav, mp3, captions, video) if path]})
+        return SynchronizedOutputs(wav_path=str(wav), mp3_path=str(mp3), english_srt_path=str(captions),
+                                   manifest_path=str(manifest), duration_seconds=plan.duration_seconds,
+                                   segment_count=len(plan.segments), video_path=str(video) if video else None)
 
     def segment_audio(self, segment_id: int, rate: float = 1.0) -> Path:
         with session_scope(self.db_url) as s:

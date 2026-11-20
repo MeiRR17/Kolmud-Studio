@@ -6,8 +6,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
+import re
 
-from sqlalchemy import JSON, Float, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text, create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -27,15 +28,30 @@ class Lesson(Base):
     title: Mapped[str] = mapped_column(String(300))
     created_at: Mapped[datetime] = mapped_column(default=_utcnow)
     source_audio_path: Mapped[str | None] = mapped_column(String(1000))
+    source_asset: Mapped[dict | None] = mapped_column(JSON)
     hebrew_transcript: Mapped[str] = mapped_column(Text, default="")
     asr_segments: Mapped[list | None] = mapped_column(JSON)
     master_audio_path: Mapped[str | None] = mapped_column(String(1000))
     translation_source_text: Mapped[str | None] = mapped_column(Text)
     master_signature: Mapped[str | None] = mapped_column(String(64))
+    timeline_revision: Mapped[str | None] = mapped_column(String(32))
 
     segments: Mapped[list[Segment]] = relationship(
         back_populates="lesson", cascade="all, delete-orphan", order_by="Segment.position"
     )
+    source_cues: Mapped[list[SourceCue]] = relationship(
+        back_populates="lesson", cascade="all, delete-orphan", order_by="SourceCue.position"
+    )
+
+    @property
+    def current_source_cues(self) -> list[SourceCue]:
+        return [cue for cue in self.source_cues if cue.revision == self.timeline_revision]
+
+    @property
+    def source_timeline_is_stale(self) -> bool:
+        cues = self.current_source_cues
+        normalize = lambda text: re.sub(r"\s+", " ", text).strip()
+        return bool(cues) and normalize(" ".join(cue.text for cue in cues)) != normalize(self.hebrew_transcript)
 
     @property
     def translation_is_stale(self) -> bool:
@@ -58,6 +74,8 @@ class Segment(Base):
     audio_duration: Mapped[float | None] = mapped_column(Float)
     # The TTS text the current audio was generated from, to flag audio that's out of date.
     audio_source_text: Mapped[str | None] = mapped_column(Text)
+    source_cue_id: Mapped[int | None] = mapped_column(ForeignKey("source_cues.id", ondelete="SET NULL"))
+    audio_origin: Mapped[str | None] = mapped_column(String(20))
 
     lesson: Mapped[Lesson] = relationship(back_populates="segments")
     attempts: Mapped[list[PracticeAttempt]] = relationship(
@@ -66,7 +84,32 @@ class Segment(Base):
 
     @property
     def audio_is_stale(self) -> bool:
-        return bool(self.audio_path) and self.audio_source_text != self.english_tts_phonetic
+        target = self.english_display if self.audio_origin == "recorded" else self.english_tts_phonetic
+        return bool(self.audio_path) and self.audio_source_text != target
+
+
+class SourceCue(Base):
+    """Source-time anchors. Older transcription generations remain available."""
+
+    __tablename__ = "source_cues"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lesson_id: Mapped[int] = mapped_column(ForeignKey("lessons.id", ondelete="CASCADE"), index=True)
+    revision: Mapped[str] = mapped_column(String(32))
+    position: Mapped[int] = mapped_column(Integer)
+    source_audio_path: Mapped[str] = mapped_column(String(1000))
+    source_audio_sha256: Mapped[str] = mapped_column(String(64))
+    start: Mapped[float] = mapped_column(Float)
+    end: Mapped[float] = mapped_column(Float)
+    raw_text: Mapped[str] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+    words: Mapped[list] = mapped_column(JSON, default=list)
+    reviewed: Mapped[bool] = mapped_column(Boolean, default=False)
+    timing_basis: Mapped[str] = mapped_column(String(40), default="whisper_asr_segment")
+    edit_version: Mapped[int] = mapped_column(Integer, default=0)
+    edits: Mapped[list] = mapped_column(JSON, default=list)
+    lesson: Mapped[Lesson] = relationship(back_populates="source_cues")
 
 
 class PracticeAttempt(Base):
@@ -102,9 +145,15 @@ def get_engine(database_url: str) -> Engine:
     with engine.begin() as connection:
         connection.exec_driver_sql("BEGIN IMMEDIATE")
         columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(lessons)")}
-        for name, kind in (("translation_source_text", "TEXT"), ("master_signature", "VARCHAR(64)")):
+        for name, kind in (("translation_source_text", "TEXT"), ("master_signature", "VARCHAR(64)"),
+                           ("timeline_revision", "VARCHAR(32)"), ("source_asset", "JSON")):
             if name not in columns:
                 connection.exec_driver_sql(f"ALTER TABLE lessons ADD COLUMN {name} {kind}")
+        segment_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(segments)")}
+        if "source_cue_id" not in segment_columns:
+            connection.exec_driver_sql("ALTER TABLE segments ADD COLUMN source_cue_id INTEGER REFERENCES source_cues(id) ON DELETE SET NULL")
+        if "audio_origin" not in segment_columns:
+            connection.exec_driver_sql("ALTER TABLE segments ADD COLUMN audio_origin VARCHAR(20)")
     return engine
 
 

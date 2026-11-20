@@ -56,7 +56,7 @@ def service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> StudioService:
     monkeypatch.setattr(svc, "make_tts_engine", lambda choice=None: tts)
     monkeypatch.setattr(svc.asr, "transcribe_hebrew_lecture", lambda path, **kw: {
         "full_text": "נחלקו הראשונים בגדר מלאכת בורר בשבת.",
-        "segments": [{"start": 0.0, "end": 2.0, "text": "נחלקו הראשונים בגדר מלאכת בורר בשבת."}],
+        "segments": [{"start": 0.0, "end": 1.0, "text": "נחלקו הראשונים בגדר מלאכת בורר בשבת."}],
     })
     monkeypatch.setattr(svc.asr, "transcribe_english_practice", lambda path: {
         "recognized_text": "On Shabbat the Rambam explains the melakha of boy",

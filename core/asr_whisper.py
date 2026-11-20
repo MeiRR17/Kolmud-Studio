@@ -19,6 +19,7 @@ class TimedSegment(TypedDict):
     start: float
     end: float
     text: str
+    words: list[TimedWord]
 
 
 class TimedWord(TypedDict):
@@ -139,9 +140,11 @@ class LocalWhisperEngine:
             # Conditioning on previous text makes large-v3 prone to repetition loops on hour-long
             # lectures; chunks are independent anyway.
             condition_on_previous_text=False,
+            word_timestamps=True,
         )
         segments: list[TimedSegment] = [
-            {"start": float(seg["start"]), "end": float(seg["end"]), "text": seg["text"].strip()}
+            {"start": float(seg["start"]), "end": float(seg["end"]), "text": seg["text"].strip(),
+             "words": list(seg.get("words", []))}
             for seg in result.get("segments", [])
             if seg.get("text", "").strip()
         ]

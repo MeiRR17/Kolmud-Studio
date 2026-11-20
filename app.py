@@ -17,6 +17,7 @@ from core.config import detect_hardware, get_settings
 from core.llm_translator import list_ollama_models
 from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, VoiceRejectedError
 from core.schemas import AttemptOut, LessonOut, SegmentOut, SegmentUpdate
+from core.schemas import SourceCueUpdate
 
 st.set_page_config(page_title=f"Kolmud Studio v{__version__}", page_icon="🎙️", layout="wide", initial_sidebar_state="expanded")
 
@@ -293,8 +294,114 @@ def render_segment_editor(seg: SegmentOut) -> None:
                     show_error(exc)
         if seg.audio_is_stale:
             st.warning("הסקריפט הפונטי נערך אחרי הפקת האודיו — הפק מחדש.")
+        st.caption("מקור האודיו: " + ("הקלטה שלך" if seg.audio_origin == "recorded" else "קול מיוצר"))
+        recording = st.audio_input("הקלט את האנגלית לפסקה הזו", key=f"english_recording_{seg.id}")
+        uploaded = st.file_uploader("או העלה הקלטה באנגלית לפסקה הזו", type=["wav", "mp3", "m4a", "flac"], key=f"english_upload_{seg.id}")
+        if st.button("השתמש בהקלטה שלי לפסקה", key=f"use_english_{seg.id}", disabled=not (recording or uploaded)):
+            try:
+                selected_recording = recording or uploaded
+                svc.attach_segment_recording(seg.id, getattr(selected_recording, "name", "english.wav"), selected_recording.getvalue())
+                st.rerun()
+            except Exception as exc:
+                show_error(exc)
         if (audio := abs_path(seg.audio_path)) is not None:
             st.audio(str(audio))
+
+
+def render_dubbing(lesson_id: int) -> None:
+    with st.expander("🎬 התאמת האודיו באנגלית לזמני הסרטון המקורי", expanded=False):
+        st.caption("כל פסקה משתמשת בקול שהופק או בהקלטה שלך. קטעים ארוכים מדי מסומנים לתיקון; מילים אינן נחתכות כדי להכניס אותן לזמן.")
+        if st.button("בדוק התאמה לזמני המקור", key=f"fit_plan_{lesson_id}"):
+            try:
+                plan = svc.get_dubbing_plan(lesson_id)
+                statuses = {"ready": "מתאים", "missing_audio": "חסרה הקלטה", "stale_audio": "הטקסט השתנה — נדרשת הקלטה חדשה",
+                            "too_long": "ארוך מדי — לקצר תרגום או להקליט מחדש", "empty_audio": "הקלטה ריקה",
+                            "source_window_out_of_range": "זמן המקור חורג מההקלטה"}
+                st.dataframe([{"פסקה": row["position"], "תחילה": row["start"], "סוף": row["end"],
+                               "אורך דיבור": row["audio_duration"], "מקור": "הקלטה שלך" if row["audio_origin"] == "recorded" else "קול מיוצר",
+                               "מצב": statuses[row["status"]]} for row in plan.segments], hide_index=True)
+            except Exception as exc:
+                show_error(exc)
+        if st.button("הפק פס קול אנגלי מסונכרן למקור", key=f"fit_render_{lesson_id}"):
+            try:
+                with st.spinner("מתאים קצב וממקם קטעים על ציר הזמן של המקור…"):
+                    outputs = svc.build_synchronized_audio(lesson_id)
+                st.audio(outputs.mp3_path)
+                st.download_button("⬇️ שמע מסונכרן", Path(outputs.mp3_path).read_bytes(),
+                                   f"lesson_{lesson_id}.source_synced.en.mp3", "audio/mpeg", on_click="ignore")
+                st.download_button("⬇️ כתוביות לפס הקול", Path(outputs.english_srt_path).read_bytes(),
+                                   f"lesson_{lesson_id}.source_synced.en.srt", "application/x-subrip", on_click="ignore")
+                st.info("נדרשת האזנה ובדיקת איכות לפני פרסום.")
+                if outputs.video_path:
+                    st.video(outputs.video_path)
+            except Exception as exc:
+                show_error(exc)
+
+
+def render_source_timeline(lesson_id: int, transcript_key: str) -> bool:
+    timeline = svc.get_source_timeline(lesson_id)
+    if not timeline.cues:
+        return False
+    with st.expander("🕒 מקטעי המקור: האזנה, תיקון וכתוביות לסרטון", expanded=False):
+        st.caption("הזמנים מקורם בזיהוי הדיבור. בדיקת הקטע מול ההקלטה נדרשת; זה עדיין אינו יישור כפוי של כל מילה.")
+        st.write(f"{len(timeline.cues)} מקטעים · {timeline.pending_review} ממתינים לבדיקת מקור")
+        if timeline.stale:
+            st.warning("מפת המקור אינה עדכנית או שיש חפיפת זמנים. ייצוא מתוזמן ייחסם עד לתיקון.")
+            for flag in timeline.flags:
+                st.caption(flag)
+        selected = st.selectbox(
+            "מקטע מקור לבדיקה", [cue.id for cue in timeline.cues],
+            format_func=lambda cue_id: next(
+                f"{cue.position}: {cue.start:.2f}–{cue.end:.2f} · {cue.text[:65]}" for cue in timeline.cues if cue.id == cue_id),
+            key=f"source_select_{lesson_id}_{timeline.revision}",
+        )
+        cue = next(cue for cue in timeline.cues if cue.id == selected)
+        source = abs_path(svc.get_lesson(lesson_id).source_audio_path)
+        if source:
+            st.audio(str(source), start_time=cue.start, end_time=cue.end)
+        st.caption("תמלול הזיהוי המקורי: " + cue.raw_text)
+        flag_labels = {
+            "unreviewed": "טרם נבדק מול ההקלטה", "no_word_timestamps": "קיימים זמני מקטע בלבד",
+            "word_timestamps_need_realignment": "הטקסט תוקן; זמני המילים המקוריים אינם יישור לטקסט החדש",
+            "low_word_confidence": "זיהוי חלש של מילה", "long_caption": "מקטע ארוך לכתובית",
+            "fast_caption": "טקסט צפוף ביחס לזמן", "overlapping_source_cues": "חפיפה עם מקטע קודם",
+        }
+        for flag in cue.flags:
+            st.caption("• " + flag_labels.get(flag, flag))
+        with st.form(f"source_edit_{cue.id}_{cue.edit_version}"):
+            text = st.text_area("העברית שנשמעת במקטע", value=cue.text)
+            left, right = st.columns(2)
+            start = left.number_input("תחילת המקטע (שניות)", min_value=0.0, value=cue.start, step=0.01, format="%.2f")
+            end = right.number_input("סוף המקטע (שניות)", min_value=0.001, value=cue.end, step=0.01, format="%.2f")
+            reviewed = st.checkbox("האזנתי ובדקתי את הטקסט וגבולות המקטע", value=cue.reviewed)
+            if st.form_submit_button("שמור תיקון מקטע"):
+                try:
+                    svc.update_source_cue(cue.id, SourceCueUpdate(expected_version=cue.edit_version, text=text,
+                                                                 start=start, end=end, reviewed=reviewed))
+                    st.session_state[transcript_key] = svc.get_lesson(lesson_id).hebrew_transcript
+                    st.rerun()
+                except Exception as exc:
+                    show_error(exc)
+        h, e = st.columns(2)
+        for column, english in ((h, False), (e, True)):
+            if column.button("הכן כתוביות עברית + אנגלית למקור" if english else "הכן כתוביות עברית למקור",
+                             key=f"source_captions_{lesson_id}_{english}", disabled=timeline.stale):
+                try:
+                    outputs = svc.build_source_captions(lesson_id, include_english=english)
+                    st.session_state[f"source_caps_{lesson_id}"] = outputs.model_dump()
+                except Exception as exc:
+                    show_error(exc)
+        # Caption generations are offered only in the request that built them.
+        # Later reruns must rebuild/revalidate; old paths cannot masquerade as current.
+        exports = st.session_state.pop(f"source_caps_{lesson_id}", None)
+        if exports:
+            st.info("אלה כתוביות על ציר הזמן של המקור, לפני בדיקת איכות ופרסום ב־YouTube.")
+            st.download_button("⬇️ כתוביות עברית למקור", Path(exports["hebrew_srt_path"]).read_bytes(),
+                               f"lesson_{lesson_id}.source.he.srt", "application/x-subrip", on_click="ignore")
+            if exports["english_srt_path"]:
+                st.download_button("⬇️ כתוביות אנגלית למקור", Path(exports["english_srt_path"]).read_bytes(),
+                                   f"lesson_{lesson_id}.source.en.srt", "application/x-subrip", on_click="ignore")
+    return not timeline.stale
 
 
 with tab_studio:
@@ -331,7 +438,12 @@ with tab_studio:
                     except Exception as exc:  # noqa: BLE001
                         show_error(exc)
 
+        source_timeline_ready = render_source_timeline(lesson.id, transcript_key)
         st.subheader("שלב ב׳: עריכת התמלול ותרגום")
+        source_timed = st.checkbox("שמור קישור של התרגום למקטעי הזמן של המקור",
+                                  value=source_timeline_ready, disabled=not source_timeline_ready,
+                                  key=f"source_timed_{lesson.id}_{lesson.timeline_revision}")
+        source_timed = source_timed and source_timeline_ready
         _init_state(transcript_key, lesson.hebrew_transcript)
         st.text_area("טקסט השיעור בעברית (אפשר גם להדביק ישירות):", key=transcript_key, height=260)
         t1, t2, _ = st.columns([1, 2, 2])
@@ -348,6 +460,7 @@ with tab_studio:
                 try:
                     lesson = svc.translate(
                         lesson.id, llm_choice,
+                        source_timed=source_timed,
                         on_progress=lambda done, total: bar.progress(
                             done / max(total, 1), text=f"מתרגם קטע {min(done + 1, total)} מתוך {total}…"),
                     )
@@ -369,6 +482,9 @@ with tab_studio:
 
             for seg in lesson.segments:
                 render_segment_editor(seg)
+
+            if lesson.timeline_revision:
+                render_dubbing(lesson.id)
 
             g1, g2 = st.columns(2)
             if g1.button("🎙️ הפק את כל הפסקאות החסרות/שעודכנו", type="primary"):

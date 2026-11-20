@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
 import re
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +17,7 @@ from urllib.parse import urlsplit
 from typing import Callable
 
 from core import __version__
+from core.artifacts import private_json, private_text
 from core.audio_utils import AudioToolError
 from core.pipeline import StudioService, WorkflowStateError, file_digest
 from core.runtime import PipelineBusyError, file_lock
@@ -28,29 +27,6 @@ STAGES = ("transcript", "translation", "audio", "master")
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def private_text(path: Path, value: str) -> None:
-    """Atomically replace a private file, including a durable file flush."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".checkpoint-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
-
-
-def private_json(path: Path, value: dict) -> None:
-    private_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def loopback_url(url: str) -> bool:
@@ -104,7 +80,7 @@ class PipelineRunner:
 
     def run(self, source: Path | None = None, *, job_id: str | None = None,
             until: str | None = None, title: str | None = None, goal_ids: list[str] | None = None,
-            on_started: Callable[[str], None] | None = None) -> dict:
+            on_started: Callable[[str], None] | None = None, source_timed: bool | None = None) -> dict:
         with file_lock(self.service.settings.data_dir / ".jobs.lock"):
             if job_id:
                 job = self.read(job_id)
@@ -121,13 +97,16 @@ class PipelineRunner:
                     "title": title or source.stem, "goalIds": goal_ids or [], "completedStages": [],
                     "models": {}, "steps": [], "until": until or "transcript", "lessonId": None,
                 }
+            if source_timed is not None:
+                job["translationMode"] = "source_timed" if source_timed else "free"
+            job.setdefault("translationMode", "free")
             target = until or job["until"]
             if target not in STAGES:
                 raise ValueError("Unknown pipeline stage.")
             # Fail before attaching private audio or invoking any model.
             self._policy(target)
             job.update(until=target, status="RUNNING", attempts=job["attempts"] + 1, errorType=None, errorMessage=None)
-            for field in ("manifestPath", "reviewPath", "handoffErrorType"):
+            for field in ("manifestPath", "reviewPath", "handoffErrorType", "sourceCaptions"):
                 job.pop(field, None)
             self._save(job)
             if on_started:
@@ -200,8 +179,15 @@ class PipelineRunner:
             return
 
         self._stage(job, "translation")
-        if not lesson.segments or lesson.translation_is_stale:
-            lesson = svc.translate(lesson.id)
+        timed = job["translationMode"] == "source_timed"
+        links_current = True
+        if timed:
+            timeline = svc.get_source_timeline(lesson.id)
+            if timeline.stale:
+                raise WorkflowStateError("Review the current source timeline before timed translation.")
+            links_current = [seg.source_cue_id for seg in lesson.segments] == [cue.id for cue in timeline.cues]
+        if not lesson.segments or lesson.translation_is_stale or not links_current:
+            lesson = svc.translate(lesson.id, source_timed=True) if timed else svc.translate(lesson.id)
             job["models"]["translation"] = settings.ollama_model
             job["steps"].append({"tool": "Ollama", "detail": "Translated the current transcript; applied pronunciation lexicon.", "at": now()})
         self._complete(job, "translation")
@@ -269,6 +255,16 @@ class PipelineRunner:
             snapshot = directory / "lesson.json"
             private_json(snapshot, lesson.model_dump(mode="json"))
             asset("Lesson text and paragraphs", snapshot)
+            if job["translationMode"] == "source_timed" and STAGES.index(job["until"]) >= 1:
+                # Regenerate from current state on each handoff; never include
+                # a stale source caption from an earlier attempt.
+                if job["status"] != "FAILED":
+                    captions = self.service.build_source_captions(lesson.id)
+                    job["sourceCaptions"] = captions.model_dump()
+                    for key, label in (("hebrew_srt_path", "Source Hebrew captions"),
+                                       ("english_srt_path", "Source English captions"),
+                                       ("manifest_path", "Source caption manifest")):
+                        asset(label, Path(getattr(captions, key)))
             source = self.service.abs_path(lesson.source_audio_path)
             if source and source.is_file():
                 asset("Source recording (normalized)", source)
@@ -310,7 +306,7 @@ class PipelineRunner:
             questions.append("Listen to the generated voice and check pronunciation. Synthetic voice does not replace an authentic teacher recording when one is required.")
         manifest = {"schemaVersion": 1, "producer": {"name": "Kolmud Studio", "version": __version__},
                     "jobId": job["id"], "lessonId": job["lessonId"], "status": job["status"],
-                    "requestedStage": job["until"], "source": job["source"], "goalIds": job["goalIds"],
+                    "requestedStage": job["until"], "translationMode": job["translationMode"], "source": job["source"], "goalIds": job["goalIds"],
                     "models": job["models"], "voice": job.get("voice"), "assets": assets, "checks": checks, "openQuestions": questions}
         manifest_path = directory / "manifest.json"
         private_json(manifest_path, manifest)

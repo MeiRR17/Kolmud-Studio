@@ -21,13 +21,28 @@ def main(argv=None) -> int:
     run.add_argument("--title")
     run.add_argument("--goal-id", action="append", default=[])
     run.add_argument("--until", choices=("transcript", "translation", "audio", "master"), default="transcript")
+    run.add_argument("--source-timed", action="store_true", help="Keep explicit source-cue links and export captions on the original timeline.")
     resume = commands.add_parser("resume", help="Resume an existing job; optionally extend its target stage.")
     resume.add_argument("job_id")
     resume.add_argument("--until", choices=("transcript", "translation", "audio", "master"))
+    resume.add_argument("--source-timed", action="store_true", default=None)
     status = commands.add_parser("status", help="Inspect a saved checkpoint.")
     status.add_argument("job_id")
     commands.add_parser("jobs", help="List persisted jobs.")
     commands.add_parser("doctor", help="Inspect local prerequisites without running inference.")
+    timeline = commands.add_parser("timeline", help="Inspect current source cues, timing and review flags.")
+    timeline.add_argument("lesson_id", type=int)
+    captions = commands.add_parser("source-captions", help="Export SRT on the original recording's timeline, without TTS.")
+    captions.add_argument("lesson_id", type=int)
+    captions.add_argument("--hebrew-only", action="store_true")
+    recording = commands.add_parser("recording", help="Attach your English recording for one translated paragraph.")
+    recording.add_argument("segment_id", type=int)
+    recording.add_argument("source", type=Path)
+    for name, description in (("dubbing-plan", "Inspect English audio fit to the original source windows."),
+                              ("synchronize", "Render English audio on the original source timeline.")):
+        command = commands.add_parser(name, help=description)
+        command.add_argument("lesson_id", type=int)
+        command.add_argument("--max-speed", type=float, default=1.15)
     args = parser.parse_args(argv)
     # Engine warnings (e.g. XTTS falling back from Metal to CPU) go to stderr; stdout stays JSON.
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -66,11 +81,22 @@ def main(argv=None) -> int:
                 runner = PipelineRunner(StudioService(settings))
                 started = lambda job_id: print(f"Job ID: {job_id} (resume with: kolmud resume {job_id})", file=sys.stderr)
                 if args.command == "run":
-                    result = runner.run(args.source, until=args.until, title=args.title, goal_ids=args.goal_id, on_started=started)
+                    result = runner.run(args.source, until=args.until, title=args.title, goal_ids=args.goal_id, on_started=started, source_timed=args.source_timed)
                 elif args.command == "resume":
-                    result = runner.run(job_id=args.job_id, until=args.until, on_started=started)
+                    result = runner.run(job_id=args.job_id, until=args.until, on_started=started, source_timed=args.source_timed)
                 elif args.command == "status":
                     result = runner.read(args.job_id)
+                elif args.command == "timeline":
+                    result = runner.service.get_source_timeline(args.lesson_id).model_dump(mode="json")
+                elif args.command == "source-captions":
+                    result = runner.service.build_source_captions(args.lesson_id, include_english=not args.hebrew_only).model_dump()
+                elif args.command == "recording":
+                    result = runner.service.attach_segment_recording(args.segment_id, args.source.name,
+                                                                      args.source.read_bytes()).model_dump(mode="json")
+                elif args.command == "dubbing-plan":
+                    result = runner.service.get_dubbing_plan(args.lesson_id, args.max_speed).model_dump()
+                elif args.command == "synchronize":
+                    result = runner.service.build_synchronized_audio(args.lesson_id, args.max_speed).model_dump()
                 else:
                     result = runner.list_jobs()
         print(json.dumps(result, ensure_ascii=False, indent=2))
