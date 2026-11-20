@@ -1,8 +1,52 @@
 # Native YouTube captions (unreleased)
 
 This connector delivers the current Hebrew/English captions to an **existing owned
-video**. Processing jobs never publish implicitly. The local FastAPI interface has
+video**, or a **new generated video with English captions** using the separate
+workflow below. No existing video is needed for the generated route. Processing jobs
+never publish implicitly. The local FastAPI interface has
 no publishing endpoint; no Google account is connected by installing this branch.
+
+## Generated video upload
+
+Generate a video with `kolmud run SCRIPT --input-kind text --until video`, an audio
+input with `--until video`, or `kolmud video LESSON_ID` for an existing lesson. These
+produce text slides and English narration without a filmed source. The result contains
+`manifest_path`, MP4, narration WAV, SRT, poster and storyboard paths.
+
+With the same data directory and an explicitly connected channel:
+
+```bash
+kolmud youtube-video-prepare LESSON_ID /absolute/path/generated_video/GENERATION/manifest.json --channel-id CHANNEL_ID
+# Watch the MP4; review narration, captions, rights, metadata and selected channel.
+kolmud youtube-video-approve /absolute/path/publications/REQUEST/youtube-review.json --reviewed
+kolmud youtube-video-publish /absolute/path/publications/REQUEST/youtube-review.json
+```
+
+The review shows exact title/description, Education category and **private** visibility.
+Synthetic narration is marked in upload metadata. Only private uploads are supported;
+public visibility/scheduling is a separate owner action. Changed title, source text,
+audio, generated files, font or channel invalidates delivery. Preparing another request
+creates another upload identity: retry the **same review** after an interruption.
+
+Upload follows [Google's resumable protocol](https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol)
+and [videos.insert](https://developers.google.com/youtube/v3/docs/videos/insert). A private
+receipt saves the server session **before** sending media, uploads bounded 8 MiB chunks,
+and queries the acknowledged offset after a lost response. The returned video ID is
+checkpointed before captions, so a caption failure reuses that video. An expired or
+ambiguous session fails for reconciliation; it never automatically starts a second
+upload. The session URI is a private capability excluded from stdout/errors and stored
+only in mode-0600 receipts. Don't share that file while a session remains active.
+
+After upload, ownership, duration, title and private visibility are read back, followed
+by native **English** captions on the generated narration timeline. Original Hebrew
+audio times are not attached to the newly paced video. `verified_private_delivery`
+means those checks and caption readback passed, not public publication, linguistic
+approval or pixel-for-pixel YouTube transcoding verification.
+
+`awaiting_youtube_processing` means captions are still processing; retry later. Video
+processing can temporarily prevent duration verification: the receipt keeps the video
+ID in `interrupted_reconcile_required`, and retry reuses it. Real OAuth/upload/channel
+behavior remains unverified until an owner-selected pilot is run.
 
 ## One-time owner setup
 
@@ -100,5 +144,6 @@ The synchronized WAV/MP3/MP4 generation is implemented locally. No public API ro
 for adding our own secondary audio track to the same YouTube video has been verified.
 [YouTube's documented flow](https://support.google.com/youtube/answer/13338784?hl=en)
 uses desktop Studio, and access depends on channel features. Do not report native
-caption publication as completed dubbed-audio delivery. A separate English video
-upload would be a different product choice and is not silently substituted.
+caption publication as completed dubbed-audio delivery. New automatically generated
+English videos use the explicit workflow above; that is separate from adding a
+secondary track to an existing filmed source video.

@@ -22,7 +22,7 @@ from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, Wo
 from core.runtime import PipelineBusyError
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
 from core.schemas import SourceCaptionOutputs, SourceCueOut, SourceCueUpdate, SourceTimelineOut
-from core.schemas import DubbingPlan, SynchronizedOutputs
+from core.schemas import DubbingPlan, SynchronizedOutputs, GeneratedVideoOutputs
 from core.tts_cloner import TTSError
 
 app = FastAPI(title="Kolmud Studio — TorahVoice & Accent Lab", version=__version__)
@@ -197,6 +197,11 @@ def synthesize_lesson(lesson_id: int, svc: Service, body: SynthesizeRequest | No
 @app.post("/lessons/{lesson_id}/master", response_model=MasterOutputs)
 def build_master(lesson_id: int, svc: Service) -> MasterOutputs:
     return svc.build_master(lesson_id)
+
+
+@app.post("/lessons/{lesson_id}/generated-video", response_model=GeneratedVideoOutputs)
+def generate_lesson_video(lesson_id: int, svc: Service) -> GeneratedVideoOutputs:
+    return svc.build_generated_video(lesson_id)
 
 
 @app.get("/lessons/{lesson_id}/master/{kind}")

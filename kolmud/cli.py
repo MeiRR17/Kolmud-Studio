@@ -20,11 +20,12 @@ def main(argv=None) -> int:
     run.add_argument("source", type=Path)
     run.add_argument("--title")
     run.add_argument("--goal-id", action="append", default=[])
-    run.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized"), default="transcript")
+    run.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized", "video"), default="transcript")
+    run.add_argument("--input-kind", choices=("audio", "text"), default="audio", help="text accepts a UTF-8 Hebrew script; no source recording required.")
     run.add_argument("--source-timed", action="store_true", help="Keep explicit source-cue links and export captions on the original timeline.")
     resume = commands.add_parser("resume", help="Resume an existing job; optionally extend its target stage.")
     resume.add_argument("job_id")
-    resume.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized"))
+    resume.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized", "video"))
     resume.add_argument("--source-timed", action="store_true", default=None)
     for command in (run, resume):
         command.add_argument("--voice-mode", choices=("synthetic", "recorded", "mixed"), default=None,
@@ -42,6 +43,8 @@ def main(argv=None) -> int:
     recording = commands.add_parser("recording", help="Attach your English recording for one translated paragraph.")
     recording.add_argument("segment_id", type=int)
     recording.add_argument("source", type=Path)
+    video = commands.add_parser("video", help="Generate an English text-slide video from current paragraph audio; no filmed video needed.")
+    video.add_argument("lesson_id", type=int)
     for name, description in (("dubbing-plan", "Inspect English audio fit to the original source windows."),
                               ("synchronize", "Render English audio on the original source timeline.")):
         command = commands.add_parser(name, help=description)
@@ -61,6 +64,16 @@ def main(argv=None) -> int:
     publish = commands.add_parser("youtube-publish", help="Upload/update reviewed native captions and verify remote content.")
     publish.add_argument("review", type=Path)
     publish.add_argument("--credentials", type=Path)
+    video_prepare = commands.add_parser("youtube-video-prepare", help="Prepare a generated MP4 for reviewed upload to a new private YouTube video.")
+    video_prepare.add_argument("lesson_id", type=int)
+    video_prepare.add_argument("manifest", type=Path)
+    video_prepare.add_argument("--channel-id", required=True)
+    video_approve = commands.add_parser("youtube-video-approve", help="Record owner review of generated video and selected upload channel.")
+    video_approve.add_argument("review", type=Path)
+    video_approve.add_argument("--reviewed", action="store_true", required=True)
+    video_publish = commands.add_parser("youtube-video-publish", help="Resume private video upload, then deliver and verify its native English captions.")
+    video_publish.add_argument("review", type=Path)
+    video_publish.add_argument("--credentials", type=Path)
     args = parser.parse_args(argv)
     # Engine warnings (e.g. XTTS falling back from Metal to CPU) go to stderr; stdout stays JSON.
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -103,7 +116,8 @@ def main(argv=None) -> int:
                 started = lambda job_id: print(f"Job ID: {job_id} (resume with: kolmud resume {job_id})", file=sys.stderr)
                 if args.command == "run":
                     result = runner.run(args.source, until=args.until, title=args.title, goal_ids=args.goal_id, on_started=started,
-                                        source_timed=args.source_timed, voice_mode=args.voice_mode, max_speed=args.max_speed)
+                                        source_timed=args.source_timed, voice_mode=args.voice_mode, max_speed=args.max_speed,
+                                        input_kind=args.input_kind)
                 elif args.command == "resume":
                     result = runner.run(job_id=args.job_id, until=args.until, on_started=started, source_timed=args.source_timed,
                                         voice_mode=args.voice_mode, max_speed=args.max_speed)
@@ -113,6 +127,8 @@ def main(argv=None) -> int:
                     result = runner.service.get_source_timeline(args.lesson_id).model_dump(mode="json")
                 elif args.command == "source-captions":
                     result = runner.service.build_source_captions(args.lesson_id, include_english=not args.hebrew_only).model_dump()
+                elif args.command == "video":
+                    result = runner.service.build_generated_video(args.lesson_id).model_dump()
                 elif args.command == "recording":
                     result = runner.service.attach_segment_recording(args.segment_id, args.source.name,
                                                                       args.source.read_bytes()).model_dump(mode="json")
@@ -121,12 +137,14 @@ def main(argv=None) -> int:
                 elif args.command == "synchronize":
                     result = runner.service.build_synchronized_audio(args.lesson_id, args.max_speed).model_dump()
                 elif args.command.startswith("youtube-"):
-                    from core.publication import CaptionPublication
-                    publication = CaptionPublication(runner.service)
-                    if args.command == "youtube-prepare":
+                    from core.publication import CaptionPublication, VideoPublication
+                    publication = VideoPublication(runner.service) if args.command.startswith("youtube-video-") else CaptionPublication(runner.service)
+                    if args.command == "youtube-video-prepare":
+                        result = publication.prepare(args.lesson_id, args.manifest, args.channel_id)
+                    elif args.command == "youtube-prepare":
                         result = publication.prepare(args.lesson_id, args.video_id, args.channel_id,
                                                      include_english=not args.hebrew_only)
-                    elif args.command == "youtube-approve":
+                    elif args.command in ("youtube-approve", "youtube-video-approve"):
                         result = publication.approve(args.review, reviewed=args.reviewed)
                     else:
                         from core.youtube import DEFAULT_CREDENTIALS, CaptionClient

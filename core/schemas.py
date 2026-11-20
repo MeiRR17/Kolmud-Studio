@@ -141,3 +141,14 @@ class SynchronizedOutputs(BaseModel):
     duration_seconds: float
     segment_count: int
     video_path: str | None = None
+
+
+class GeneratedVideoOutputs(BaseModel):
+    video_path: str
+    audio_path: str
+    english_srt_path: str
+    poster_path: str
+    storyboard_path: str
+    manifest_path: str
+    duration_seconds: float
+    scene_count: int

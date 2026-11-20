@@ -8,6 +8,7 @@ ASR call or translation is retried, while completed audio paragraphs are reused.
 from __future__ import annotations
 
 import ipaddress
+import hashlib
 import json
 import re
 import uuid
@@ -22,7 +23,7 @@ from core.audio_utils import AudioToolError
 from core.pipeline import StudioService, WorkflowStateError, file_digest
 from core.runtime import PipelineBusyError, file_lock
 
-STAGES = ("transcript", "translation", "audio", "master", "synchronized")
+STAGES = ("transcript", "translation", "audio", "master", "synchronized", "video")
 
 
 def now() -> str:
@@ -81,7 +82,8 @@ class PipelineRunner:
     def run(self, source: Path | None = None, *, job_id: str | None = None,
             until: str | None = None, title: str | None = None, goal_ids: list[str] | None = None,
             on_started: Callable[[str], None] | None = None, source_timed: bool | None = None,
-            voice_mode: str | None = None, max_speed: float | None = None) -> dict:
+            voice_mode: str | None = None, max_speed: float | None = None,
+            input_kind: str | None = None) -> dict:
         with file_lock(self.service.settings.data_dir / ".jobs.lock"):
             if job_id:
                 job = self.read(job_id)
@@ -97,7 +99,11 @@ class PipelineRunner:
                     "source": {"path": str(source), "sha256": file_digest(source)},
                     "title": title or source.stem, "goalIds": goal_ids or [], "completedStages": [],
                     "models": {}, "steps": [], "until": until or "transcript", "lessonId": None,
+                    "inputKind": input_kind or "audio",
                 }
+            job.setdefault("inputKind", "audio")
+            if job["inputKind"] not in ("audio", "text") or (input_kind is not None and input_kind != job["inputKind"]):
+                raise ValueError("Choose audio or text input when creating a job; resume preserves its input kind.")
             if source_timed is not None:
                 job["translationMode"] = "source_timed" if source_timed else "free"
             job.setdefault("translationMode", "free")
@@ -106,6 +112,8 @@ class PipelineRunner:
                 raise ValueError("Unknown pipeline stage.")
             if target == "synchronized":
                 job["translationMode"] = "source_timed"
+            if job["inputKind"] == "text" and job["translationMode"] == "source_timed":
+                raise WorkflowStateError("Text input has no source recording timestamps; use the narration-based video target without --source-timed.")
             if voice_mode is not None:
                 job["voiceMode"] = voice_mode
             job.setdefault("voiceMode", "synthetic")
@@ -167,8 +175,23 @@ class PipelineRunner:
             job["lessonId"] = svc.create_lesson(job["title"]).id
             self._save(job)
         lesson = svc.get_lesson(job["lessonId"])
-        attached = svc.abs_path(lesson.source_audio_path)
-        if attached is None:
+        attached = (Path(job["attachedTextPath"]) if job.get("attachedTextPath") else None) if job["inputKind"] == "text" else svc.abs_path(lesson.source_audio_path)
+        if attached is None and job["inputKind"] == "text":
+            raw = Path(job["source"]["path"]).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != job["source"]["sha256"]:
+                raise WorkflowStateError("Original script changed; create a new job.")
+            try:
+                text = raw.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise WorkflowStateError("Text input must be a UTF-8 Hebrew script.") from None
+            if not text.strip():
+                raise WorkflowStateError("The Hebrew script is empty.")
+            attached = svc._lesson_dir(lesson.id) / "source" / uuid.uuid4().hex / "script.he.txt"
+            private_text(attached, text)
+            job["attachedTextPath"] = str(attached.resolve())
+            job["attachedSha256"] = file_digest(attached)
+            self._save(job)
+        elif attached is None:
             original = Path(job["source"]["path"])
             if file_digest(original) != job["source"]["sha256"]:
                 raise WorkflowStateError("Original recording changed; create a new job.")
@@ -183,9 +206,13 @@ class PipelineRunner:
 
         self._stage(job, "transcript")
         if not lesson.hebrew_transcript.strip():
-            lesson = svc.transcribe(lesson.id)
-            job["models"]["transcription"] = settings.hebrew_asr_model
-            job["steps"].append({"tool": "MLX Whisper", "detail": "Transcribed the attached Hebrew recording.", "at": now()})
+            if job["inputKind"] == "text":
+                lesson = svc.set_transcript(lesson.id, attached.read_text(encoding="utf-8"))
+                job["steps"].append({"tool": "Hebrew script import", "detail": "Imported the selected text; no recording/ASR timestamps claimed.", "at": now()})
+            else:
+                lesson = svc.transcribe(lesson.id)
+                job["models"]["transcription"] = settings.hebrew_asr_model
+                job["steps"].append({"tool": "MLX Whisper", "detail": "Transcribed the attached Hebrew recording.", "at": now()})
         if not lesson.hebrew_transcript.strip():
             raise WorkflowStateError("Transcription was empty; review the source recording.")
         self._complete(job, "transcript")
@@ -235,6 +262,20 @@ class PipelineRunner:
         if job["until"] == "audio":
             return
 
+        if job["until"] == "video":
+            self._stage(job, "video")
+            previous = job.get("generatedVideo", {})
+            try:
+                if not previous:
+                    raise WorkflowStateError("No generated video yet.")
+                result = svc.get_generated_video(lesson.id, Path(previous["manifest_path"]))
+            except WorkflowStateError:
+                result = svc.build_generated_video(lesson.id)
+            job["generatedVideo"] = result.model_dump()
+            job["steps"].append({"tool": "Local slide renderer", "detail": "Created or verified English-narration video; no filmed source video required.", "at": now()})
+            self._complete(job, "video")
+            return
+
         if job["until"] == "synchronized":
             self._stage(job, "synchronized")
             previous = job.get("synchronizedOutputs", {})
@@ -260,7 +301,7 @@ class PipelineRunner:
 
     def _validate_target(self, job: dict) -> None:
         lesson = self.service.get_lesson(job["lessonId"])
-        source = self.service.abs_path(lesson.source_audio_path)
+        source = Path(job["attachedTextPath"]) if job["inputKind"] == "text" else self.service.abs_path(lesson.source_audio_path)
         if source is None or file_digest(source) != job["attachedSha256"]:
             raise WorkflowStateError("Attached recording changed during the run.")
         if not lesson.hebrew_transcript.strip():
@@ -283,6 +324,8 @@ class PipelineRunner:
             self.service.get_master(lesson.id)
         elif job["until"] == "synchronized":
             self.service.get_synchronized_audio(lesson.id, Path(job["synchronizedOutputs"]["manifest_path"]))
+        elif job["until"] == "video":
+            self.service.get_generated_video(lesson.id, Path(job["generatedVideo"]["manifest_path"]))
 
     def _handoff(self, job: dict) -> None:
         """Produce metadata and bounded review JSON; never publish or approve it."""
@@ -311,6 +354,8 @@ class PipelineRunner:
             source = self.service.abs_path(lesson.source_audio_path)
             if source and source.is_file():
                 asset("Source recording (normalized)", source)
+            if job["inputKind"] == "text" and job.get("attachedTextPath") and Path(job["attachedTextPath"]).is_file():
+                asset("Source Hebrew script", Path(job["attachedTextPath"]))
             if lesson.hebrew_transcript:
                 transcript = directory / "transcript.he.txt"
                 private_text(transcript, lesson.hebrew_transcript + "\n")
@@ -331,6 +376,12 @@ class PipelineRunner:
                                    ("manifest_path", "Synchronized generation manifest")):
                     if getattr(synced, key):
                         asset(label, Path(getattr(synced, key)))
+            if job["until"] == "video" and job["status"] != "FAILED":
+                generated = self.service.get_generated_video(lesson.id, Path(job["generatedVideo"]["manifest_path"]))
+                for key, label in (("video_path", "Generated English lesson video"), ("audio_path", "Generated video narration"),
+                                   ("english_srt_path", "Generated video captions"), ("poster_path", "Generated video poster"),
+                                   ("storyboard_path", "Generated video storyboard"), ("manifest_path", "Generated video manifest")):
+                    asset(label, Path(getattr(generated, key)))
             if lesson.master_audio_path and job["status"] != "FAILED":
                 # A master left over from an earlier, broader run may no longer be current;
                 # list only a verified one instead of failing a narrower (e.g. audio) job.
@@ -357,7 +408,7 @@ class PipelineRunner:
             questions.append("Listen to the English recordings/synthesis and check pronunciation and synchronization. Synthetic voice does not replace an authentic teacher recording when one is required.")
         manifest = {"schemaVersion": 1, "producer": {"name": "Kolmud Studio", "version": __version__},
                     "jobId": job["id"], "lessonId": job["lessonId"], "status": job["status"],
-                    "requestedStage": job["until"], "translationMode": job["translationMode"], "source": job["source"], "goalIds": job["goalIds"],
+                    "requestedStage": job["until"], "inputKind": job["inputKind"], "translationMode": job["translationMode"], "source": job["source"], "goalIds": job["goalIds"],
                     "models": job["models"], "voice": job.get("voice"), "voiceMode": job["voiceMode"],
                     "assets": assets, "checks": checks, "openQuestions": questions}
         manifest_path = directory / "manifest.json"
@@ -367,12 +418,12 @@ class PipelineRunner:
             "agent": {"name": "Kolmud Studio", "runtime": f"local Python CLI v{__version__}",
                       "model": "; ".join(job["models"].values()) or "No model invocation recorded; output may have been reused"},
             "startedAt": job["createdAt"], "finishedAt": job["finishedAt"],
-            "input": f"Process local recording through {job['until']}; source SHA-256: {job['source']['sha256']}.",
+            "input": f"Process local {job['inputKind']} through {job['until']}; source SHA-256: {job['source']['sha256']}.",
             "summary": f"{job['status']}: local processing through {job['stage']}. Human review is required; nothing published.",
             "goalIds": job["goalIds"], "permissions": ["Read: selected recording, reference voice and local configuration", "Write: local processing artifacts and model runtime caches", "Inference: local models only"],
             "steps": job["steps"][-200:], "artifacts": [{"label": "Content package manifest", "kind": "file", "content": str(manifest_path.resolve())}] +
                 [{"label": a["label"], "kind": "file", "content": f"{a['path']}\nSHA-256: {a['sha256']}"} for a in assets],
-            "evidence": [{"source": "Selected local recording", "anchor": "SHA-256 " + job["source"]["sha256"]}],
+            "evidence": [{"source": "Selected local " + job["inputKind"], "anchor": "SHA-256 " + job["source"]["sha256"]}],
             "checks": checks, "confidence": "low", "openQuestions": questions,
             "rollback": "Keep the original recording. This run writes local processing artifacts; first-time downloads may populate model caches. No Dvir OS state was written.",
         }

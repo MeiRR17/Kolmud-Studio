@@ -36,7 +36,7 @@ from core.llm_translator import (
 )
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
 from core.schemas import SourceCaptionOutputs, SourceCueOut, SourceCueUpdate, SourceTimelineOut
-from core.schemas import DubbingPlan, SynchronizedOutputs
+from core.schemas import DubbingPlan, SynchronizedOutputs, GeneratedVideoOutputs
 from core.source_timing import cue_flags, normalized, source_records, validate_interval, write_anchored_srt
 from core.prosody import add_content_word_stress, auto_coach_guide
 from core.runtime import exclusive_inference
@@ -639,6 +639,86 @@ class StudioService:
         if path is None or not path.exists():
             raise FileNotFoundError("No audio has been generated for this segment yet.")
         return audio_utils.tempo_variant(path, rate)
+
+    def _video_inputs(self, lesson_id: int) -> dict:
+        from core.video_renderer import find_font, RENDERER_VERSION
+
+        font = find_font(self.settings.video_font_path)
+        with session_scope(self.db_url) as s:
+            lesson = self._lesson(s, lesson_id)
+            paths, texts, signature = self._export_inputs(lesson)
+            return {"lessonId": lesson_id, "title": lesson.title, "inputSignature": signature,
+                    "rendererVersion": RENDERER_VERSION, "fontPath": str(font), "fontSha256": file_digest(font),
+                    "pauseMs": self.settings.segment_pause_ms,
+                    "segments": [{"id": seg.id, "position": seg.position, "sourceCueId": seg.source_cue_id,
+                                  "text": text, "audioPath": str(path.resolve()), "audioSha256": file_digest(path),
+                                  "audioOrigin": seg.audio_origin or "synthetic"}
+                                 for seg, path, text in zip(lesson.segments, paths, texts)]}
+
+    @exclusive_inference
+    def build_generated_video(self, lesson_id: int) -> GeneratedVideoOutputs:
+        """Generate an original text-slide video; no filmed source/video project required."""
+        from core.video_renderer import render
+
+        inputs = self._video_inputs(lesson_id)
+        directory = self._lesson_dir(lesson_id) / "generated_video" / uuid.uuid4().hex
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        audio = directory / "narration.en.wav"
+        spans = audio_utils.merge_segments([Path(seg["audioPath"]) for seg in inputs["segments"]], audio, inputs["pauseMs"])
+        audio.chmod(0o600)
+        scenes = [{"start": a, "end": b, "text": seg["text"], "paragraph": seg["id"],
+                   "sourceCueId": seg["sourceCueId"], "audioOrigin": seg["audioOrigin"]}
+                  for (a, b), seg in zip(spans, inputs["segments"])]
+        captions = write_anchored_srt([(scene["start"], scene["end"], scene["text"]) for scene in scenes],
+                                      directory / "narration.en.srt")
+        try:
+            storyboard = render(inputs["title"], scenes, audio, directory, Path(inputs["fontPath"]))
+        except ValueError as exc:
+            raise WorkflowStateError(str(exc)) from exc
+        poster = directory / "poster.png"
+        shutil.copyfile(directory / storyboard["scenes"][0]["image"], poster)
+        poster.chmod(0o600)
+        storyboard_path = directory / "storyboard.json"
+        private_json(storyboard_path, {**storyboard, "timeline": "english_narration",
+                                       "timingPrecision": "measured_paragraph_audio_not_word_alignment"})
+        if self._video_inputs(lesson_id) != inputs:
+            raise WorkflowStateError("Lesson/audio/font changed during video generation; rebuild it.")
+        manifest = directory / "manifest.json"
+        files = [directory / "lesson.en.mp4", audio, captions, poster, storyboard_path]
+        files += [directory / scene["image"] for scene in storyboard["scenes"]]
+        files.append(directory / "slides.ffconcat")
+        private_json(manifest, {"schemaVersion": 1, "producer": "Kolmud Studio", "version": __version__,
+                               "lessonId": lesson_id, "kind": "generated_text_slides", "inputs": inputs,
+                               "timeline": "english_narration", "durationSeconds": storyboard["durationSeconds"],
+                               "sceneCount": len(scenes), "publicationReady": False, "qualityReview": "required",
+                               "files": [{"path": str(path.resolve()), "sha256": file_digest(path)} for path in files]})
+        return self.get_generated_video(lesson_id, manifest)
+
+    def get_generated_video(self, lesson_id: int, manifest_path: Path) -> GeneratedVideoOutputs:
+        directory = manifest_path.expanduser().resolve().parent
+        if directory.parent != (self._lesson_dir(lesson_id) / "generated_video").resolve() or manifest_path.name != "manifest.json":
+            raise WorkflowStateError("Generated video does not belong to this lesson.")
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            if manifest["lessonId"] != lesson_id or manifest["inputs"] != self._video_inputs(lesson_id):
+                raise WorkflowStateError("Video inputs changed; generate the video again.")
+            required = {"lesson.en.mp4", "narration.en.wav", "narration.en.srt", "poster.png", "storyboard.json", "slides.ffconcat"}
+            found = set()
+            for item in manifest["files"]:
+                path = Path(item["path"]).resolve()
+                if path.parent != directory or file_digest(path) != item["sha256"]:
+                    raise WorkflowStateError("Generated video files changed; generate the video again.")
+                found.add(path.name)
+            if not required <= found:
+                raise WorkflowStateError("Generated video is incomplete.")
+            if manifest["inputs"] != self._video_inputs(lesson_id):
+                raise WorkflowStateError("Video inputs changed during verification.")
+            return GeneratedVideoOutputs(video_path=str(directory / "lesson.en.mp4"), audio_path=str(directory / "narration.en.wav"),
+                                         english_srt_path=str(directory / "narration.en.srt"), poster_path=str(directory / "poster.png"),
+                                         storyboard_path=str(directory / "storyboard.json"), manifest_path=str(directory / "manifest.json"),
+                                         duration_seconds=manifest["durationSeconds"], scene_count=manifest["sceneCount"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise WorkflowStateError("Generated video is missing or invalid; generate it again.") from exc
 
     def get_synchronized_audio(self, lesson_id: int, manifest_path: Path) -> SynchronizedOutputs:
         """Reuse a generation only while all source, paragraph and output hashes agree."""

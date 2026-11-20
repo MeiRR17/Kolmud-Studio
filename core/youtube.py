@@ -41,12 +41,12 @@ def credential_path(path: Path) -> Path:
     return path
 
 
-def _request(client, method, url, **kwargs):
+def _request(client, method, url, *, allowed_statuses=(), **kwargs):
     try:
         response = client.request(method, url, follow_redirects=False, **kwargs)
     except httpx.HTTPError:
         raise YouTubeError("Google request interrupted; retry the command to reconcile remote state.") from None
-    if not response.is_success:
+    if not response.is_success and response.status_code not in allowed_statuses:
         raise YouTubeError(f"Google request failed (HTTP {response.status_code}); check account permissions/quota and retry.")
     return response
 
@@ -177,18 +177,94 @@ class CaptionClient:
         headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {self._access_token()}"}
         return _request(self.client, method, url, headers=headers, **kwargs)
 
-    def verify_video(self, video_id, channel_id, duration):
-        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) or not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
-            raise ValueError("Use the exact YouTube video ID and channel ID (UC…).")
+    def verify_channel(self, channel_id):
+        if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
+            raise ValueError("Use the exact YouTube channel ID (UC…).")
         channels = _json(self._call("GET", API + "/channels", params={"part": "id", "mine": "true", "maxResults": 50}))
         if channel_id not in {c["id"] for c in channels.get("items", [])}:
             raise YouTubeError("Connected account does not own the selected channel.")
-        videos = _json(self._call("GET", API + "/videos", params={"part": "snippet,contentDetails", "id": video_id}))
+
+    def verify_video(self, video_id, channel_id, duration, *, expected_privacy=None, expected_title=None):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            raise ValueError("Use the exact YouTube video ID.")
+        self.verify_channel(channel_id)
+        parts = "snippet,contentDetails,status" if expected_privacy else "snippet,contentDetails"
+        videos = _json(self._call("GET", API + "/videos", params={"part": parts, "id": video_id}))
         items = videos.get("items", [])
         if len(items) != 1 or items[0].get("snippet", {}).get("channelId") != channel_id:
             raise YouTubeError("Selected video does not belong to the connected channel.")
         if abs(video_duration(items[0].get("contentDetails", {}).get("duration", "")) - duration) > 2:
             raise YouTubeError("YouTube video length differs from the local source; review the video selection.")
+        if expected_privacy and items[0].get("status", {}).get("privacyStatus") != expected_privacy:
+            raise YouTubeError("Uploaded video privacy does not match the reviewed private upload; inspect Studio.")
+        if expected_title and items[0].get("snippet", {}).get("title") != expected_title:
+            raise YouTubeError("Uploaded video title differs from the reviewed title; inspect Studio.")
+
+    @staticmethod
+    def _upload_session(url):
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "www.googleapis.com" or parsed.port is not None or parsed.username or parsed.fragment or parsed.path != "/upload/youtube/v3/videos":
+            raise YouTubeError("Google returned an unexpected upload destination; no media was sent.")
+        return url
+
+    def upload_video(self, path: Path, metadata: dict, state: dict, checkpoint, *, before_write=lambda: None):
+        """Bounded chunks; save session before media, query it after lost acknowledgements.
+
+        An expired session is an error, never permission to create another video.
+        Its URI stays in the private receipt and is not returned to CLI stdout.
+        """
+        if state.get("videoId"):
+            return state["videoId"]
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError("Generated video is empty.")
+        if not state.get("uploadSession"):
+            before_write()
+            response = self._call("POST", "https://www.googleapis.com/upload/youtube/v3/videos",
+                                  params={"uploadType": "resumable", "part": "snippet,status", "notifySubscribers": "false"},
+                                  json=metadata, headers={"X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)})
+            location = response.headers.get("Location", "")
+            state["uploadSession"] = self._upload_session(location)
+            state["uploadBytes"] = size
+            checkpoint()
+        if state.get("uploadBytes") != size:
+            raise YouTubeError("Video bytes changed after upload started; reconcile this upload before preparing a new one.")
+        session = self._upload_session(state["uploadSession"])
+        response = self._call("PUT", session, headers={"Content-Range": f"bytes */{size}", "Content-Length": "0"},
+                              content=b"", allowed_statuses=(308,))
+        while True:
+            if response.status_code in (200, 201):
+                video_id = _json(response).get("id", "")
+                if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                    raise YouTubeError("Upload completed without a valid video ID; retry to reconcile the saved session.")
+                state["videoId"] = video_id
+                state.pop("uploadSession", None)
+                state["uploadOffset"] = size
+                checkpoint()
+                return video_id
+            acknowledged = response.headers.get("Range")
+            if acknowledged:
+                match = re.fullmatch(r"bytes=0-(\d+)", acknowledged)
+                if not match:
+                    raise YouTubeError("Google returned an invalid upload offset; retry to query the saved session.")
+                offset = int(match[1]) + 1
+            else:
+                offset = 0
+            if not 0 <= offset < size:
+                raise YouTubeError("Google has not returned a completed video ID; retry the saved session, without starting another upload.")
+            before_write()
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                chunk = handle.read(8 * 1024 * 1024)  # a multiple of Google's 256 KiB chunk unit
+            state["uploadOffset"] = offset
+            checkpoint()
+            response = self._call("PUT", session, content=chunk, allowed_statuses=(308,),
+                                  headers={"Content-Type": "video/mp4", "Content-Length": str(len(chunk)),
+                                           "Content-Range": f"bytes {offset}-{offset + len(chunk) - 1}/{size}"})
+            if response.status_code == 308:
+                match = re.fullmatch(r"bytes=0-(\d+)", response.headers.get("Range", ""))
+                if not match or int(match[1]) + 1 <= offset:
+                    raise YouTubeError("Upload made no progress; retry the saved session later.")
 
     def tracks(self, video_id):
         return _json(self._call("GET", API + "/captions", params={"part": "snippet", "videoId": video_id})).get("items", [])

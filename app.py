@@ -486,6 +486,29 @@ with tab_studio:
             if lesson.timeline_revision:
                 render_dubbing(lesson.id)
 
+            with st.expander("🎬 יצירת סרטון אוטומטית — ללא צילום", expanded=True):
+                st.caption("המערכת יוצרת סרטון שקופיות טקסט באנגלית מתוך הפסקאות והאודיו שלהן. אפשר להתחיל גם מטקסט עברי מודבק. משך הסרטון נקבע לפי הקריינות, ללא צורך בסרטון מקור.")
+                video_key = f"generated_video_{lesson.id}"
+                if st.button("🎬 צור סרטון מהשיעור", key=f"make_video_{lesson.id}",
+                             disabled=ready != len(lesson.segments) or lesson.translation_is_stale):
+                    try:
+                        with st.spinner("מרנדר סרטון מקומי עם קריינות וכתוביות…"):
+                            result = svc.build_generated_video(lesson.id)
+                        st.session_state[video_key] = result.manifest_path
+                    except Exception as exc:
+                        show_error(exc)
+                if st.session_state.get(video_key):
+                    try:
+                        generated = svc.get_generated_video(lesson.id, Path(st.session_state[video_key]))
+                        st.video(generated.video_path)
+                        st.download_button("⬇️ סרטון MP4", Path(generated.video_path).read_bytes(),
+                                           f"lesson_{lesson.id}.en.mp4", "video/mp4", on_click="ignore")
+                        st.download_button("⬇️ כתוביות לסרטון שנוצר", Path(generated.english_srt_path).read_bytes(),
+                                           f"lesson_{lesson.id}.en.srt", "application/x-subrip", on_click="ignore")
+                    except Exception as exc:
+                        st.session_state.pop(video_key, None)
+                        show_error(exc)
+
             g1, g2 = st.columns(2)
             if g1.button("🎙️ הפק את כל הפסקאות החסרות/שעודכנו", type="primary"):
                 todo = [s for s in lesson.segments if not abs_path(s.audio_path) or s.audio_is_stale]

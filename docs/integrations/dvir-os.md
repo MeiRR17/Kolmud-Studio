@@ -8,7 +8,7 @@ listed in [the completion checklist](../PROJECT_STATUS_HE.md). YouTube caption
 delivery is a separate explicitly invoked CLI workflow ([guide](youtube.md));
 `run`/`resume` still never publish or approve content.
 
-1. One terminal command accepts an existing local recording and persists a job.
+1. One terminal command accepts local audio or a UTF-8 Hebrew script and persists a job.
 2. Transcription is the default; translation, cloned audio and master export are
    explicit targets. A requirement for authentic teacher speech remains a separate
    recording task and is never silently replaced by synthesis.
@@ -38,6 +38,7 @@ kolmud --data-dir /path/to/local/assets resume JOB_ID --until master
 kolmud --data-dir /path/to/local/assets run /path/to/video.mp4 --until translation --source-timed
 kolmud --data-dir /path/to/local/assets recording SEGMENT_ID /path/to/english-paragraph.wav
 kolmud --data-dir /path/to/local/assets resume JOB_ID --until synchronized --voice-mode recorded
+kolmud --data-dir /path/to/local/assets run /path/to/script.he.txt --input-kind text --until video
 ```
 
 Keep the same data directory across invocations and across UI/API/CLI when they
@@ -45,6 +46,9 @@ share lessons. Custom data storage gets a seed lexicon; its default reference vo
 path is `voice_profiles/my_reference_voice.wav` inside that directory.
 `kolmud doctor` checks hardware/prerequisites without starting inference and
 without printing credentials. `kolmud --version` works without model imports.
+The `video` target generates a new local text-slide MP4 on the English narration
+timeline; it requires no filmed video. Text input skips ASR and has no source-audio
+timestamps, so `--source-timed` and `synchronized` are refused for text-only jobs.
 `synchronized` selects source-timed translation and original-timeline exports instead
 of the concatenated `master` target. `recorded` requires a current user recording for
 every paragraph and never invokes TTS; `synthetic` uses XTTS; `mixed` preserves supplied
@@ -75,6 +79,7 @@ Under the configured data directory:
 | `projects/lesson_ID/master/GENERATION/` | Complete WAV/MP3/SRT generation |
 | `projects/lesson_ID/source_captions/GENERATION/` | Source-anchored Hebrew/English SRT, evidence manifest, optional explicit YouTube review/approval/receipt |
 | `projects/lesson_ID/synchronized/GENERATION/` | Source-timed English WAV/MP3/SRT, optional MP4 and input/output fingerprint manifest |
+| `projects/lesson_ID/generated_video/GENERATION/` | Generated MP4, measured narration, SRT, poster, storyboard, PNG slides and manifest |
 
 The handoff snapshot is updated on a retry of the same job; media generations are
 retained. Hashes let the consumer detect later file changes. They do not prove

@@ -28,6 +28,37 @@ Practice: you record a paragraph ──► English Whisper ──► clarity %, 
 Everything except the optional API providers runs offline on the Mac.
 Explicit YouTube caption publishing also requires internet and owner OAuth consent.
 
+## Automatic video creation (unreleased)
+
+A filmed video is **not required**. The studio generates an original 1920×1080
+English text-slide video from Hebrew audio or an existing Hebrew UTF-8 script:
+
+```bash
+kolmud run /path/to/lesson.m4a --until video
+kolmud run /path/to/lesson.he.txt --input-kind text --until video
+```
+
+Audio input uses local Whisper; text input skips ASR and never invents source-recording
+timestamps. Both continue through translation and the selected voice route, then render
+the complete narration, text slides, poster, storyboard and SRT locally. For recorded
+English, stop at translation, attach the paragraphs, then
+`kolmud resume JOB_ID --until video --voice-mode recorded`. Existing lessons with current
+paragraph audio can use `kolmud video LESSON_ID` or the studio's automatic-video panel.
+
+The video follows measured English paragraph audio at its natural pace. Titles support
+Hebrew RTL shaping; overflowing text fails instead of being truncated. Pillow uses an
+existing local Arial/DejaVu font, or `VIDEO_FONT_PATH`; the renderer downloads no fonts,
+stock images or models. ffmpeg encodes H.264/AAC with two encoder threads. Generated
+videos stay in ignored data storage. Slide text is the actual English paragraph.
+
+This first renderer makes text slides; avatars, face/lip animation and illustration
+generation are not implemented. The planned HyperFrames adapter remains an optional
+experiment on another branch, not a prerequisite.
+
+A new generated video can be prepared for **private** YouTube upload without an existing
+video ID. After owner review, resumable upload saves the resulting ID, adds native
+English captions and verifies them. See [the delivery guide](docs/integrations/youtube.md#generated-video-upload).
+
 ## Source-timed production (unreleased)
 
 The source timeline editor preserves raw Whisper text/word timestamps and edit history.
@@ -210,6 +241,7 @@ core/database.py           SQLite models: Lesson, Segment, PracticeAttempt
 core/pipeline.py           StudioService — the whole workflow
 core/jobs.py               checkpointed CLI jobs + Dvir OS manifest / agent-run handoff
 core/runtime.py            cross-process capacity locks
+core/video_renderer.py     offline 1080p text-slide MP4 from measured English narration
 core/source_timing.py      source-cue validation, review flags, anchored SRT
 core/dubbing.py            bounded sample-accurate source-timeline audio composition
 core/publication.py        caption generation review, freshness and delivery receipts

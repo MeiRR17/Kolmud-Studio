@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from core import audio_utils
 from core.artifacts import private_json
 from core.database import session_scope
 from core.pipeline import WorkflowStateError, file_digest
+from core.runtime import file_lock
 
 
 def _now():
@@ -124,3 +126,112 @@ class CaptionPublication:
                 private_json(receipt_path, receipt)
                 raise
         return {**receipt, "receiptPath": str(receipt_path)}
+
+
+class VideoPublication(CaptionPublication):
+    """Deliver a generated lesson to a new private video and its native English captions."""
+
+    def prepare(self, lesson_id: int, manifest_path: Path, channel_id: str) -> dict:
+        if not re.fullmatch(r"UC[A-Za-z0-9_-]{22}", channel_id):
+            raise ValueError("Use the exact YouTube channel ID (UC…).")
+        output = self.service.get_generated_video(lesson_id, manifest_path)
+        manifest_path = Path(output.manifest_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        title = manifest["inputs"]["title"]
+        if not 1 <= len(title) <= 100 or any(char in title for char in "<>"):
+            raise ValueError("YouTube title must contain 1–100 characters and no angle brackets; rename the lesson.")
+        status = {"privacyStatus": "private"}
+        if any(segment["audioOrigin"] == "synthetic" for segment in manifest["inputs"]["segments"]):
+            status["containsSyntheticMedia"] = True
+        review = {"schemaVersion": 1, "kind": "generated_video", "requestId": uuid.uuid4().hex,
+                  "lessonId": lesson_id, "channelId": channel_id, "generatedManifest": str(manifest_path),
+                  "manifestSha256": file_digest(manifest_path), "durationSeconds": output.duration_seconds,
+                  "metadata": {"snippet": {"title": title, "description": "English lesson with text slides, produced with Kolmud Studio.",
+                                           "categoryId": "27"}, "status": status},
+                  "createdAt": _now(), "reviewScope": "generated video, narration, English captions, rights, metadata and selected channel"}
+        directory = manifest_path.parent / "publications" / review["requestId"]
+        path = directory / "youtube-review.json"
+        private_json(path, review)
+        return {"reviewPath": str(path), "review": review, "video": output.model_dump(),
+                "next": "Review the generated MP4, audio, captions and channel, then run youtube-video-approve REVIEW --reviewed."}
+
+    def validate(self, review_path: Path):
+        review_path = review_path.expanduser().resolve()
+        if not review_path.is_relative_to(self.service.settings.projects_dir.resolve()):
+            raise WorkflowStateError("Use a generated-video review in this data directory.")
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+        if review.get("kind") != "generated_video" or not re.fullmatch(r"[a-f0-9]{32}", review.get("requestId", "")):
+            raise WorkflowStateError("Use a prepared generated-video review.")
+        manifest = Path(review["generatedManifest"]).resolve()
+        if review_path.parent != manifest.parent / "publications" / review["requestId"]:
+            raise WorkflowStateError("Video review does not belong to this generation.")
+        if file_digest(manifest) != review["manifestSha256"]:
+            raise WorkflowStateError("Generated video manifest changed; prepare and review again.")
+        output = self.service.get_generated_video(review["lessonId"], manifest)
+        if review["metadata"].get("status", {}).get("privacyStatus") != "private":
+            raise WorkflowStateError("Generated-video delivery currently supports private uploads only.")
+        if review["durationSeconds"] != output.duration_seconds:
+            raise WorkflowStateError("Generated video duration changed after preparation.")
+        return review, {"en": Path(output.english_srt_path).read_text(encoding="utf-8")}
+
+    def approve(self, review_path: Path, *, reviewed=False) -> dict:
+        if not reviewed:
+            raise WorkflowStateError("Review the generated video/narration/captions/rights/channel, then pass --reviewed.")
+        review_path = review_path.expanduser().resolve()
+        signature = file_digest(review_path)
+        review, files = self.validate(review_path)
+        if file_digest(review_path) != signature:
+            raise WorkflowStateError("Video review changed during approval; review again.")
+        approval = {"reviewSha256": signature, "reviewedAt": _now(), "channelId": review["channelId"],
+                    "requestId": review["requestId"], "languages": list(files), "status": "owner_review_recorded"}
+        private_json(review_path.parent / "youtube-approval.json", approval)
+        return approval
+
+    def publish(self, review_path: Path, client) -> dict:
+        review_path = review_path.expanduser().resolve()
+        review, _ = self._approved(review_path)
+        receipt_path = review_path.parent / "youtube-receipt.json"
+        with file_lock(client.credentials.parent / f".youtube-upload-{review['requestId']}.lock"):
+            review, files = self._approved(review_path)
+            signature = file_digest(review_path)
+            if receipt_path.is_file():
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if receipt.get("reviewSha256") != signature:
+                    raise WorkflowStateError("An upload exists for different reviewed bytes; reconcile it before preparing another upload.")
+            else:
+                receipt = {"reviewSha256": signature, "requestId": review["requestId"], "channelId": review["channelId"],
+                           "startedAt": _now(), "tracks": []}
+
+            def checkpoint():
+                private_json(receipt_path, receipt)
+
+            def still_current():
+                self._approved(review_path)
+                if file_digest(review_path) != signature:
+                    raise WorkflowStateError("Video review changed during upload; reconcile remote state.")
+
+            receipt["status"] = "in_progress"
+            checkpoint()
+            try:
+                client.verify_channel(review["channelId"])
+                generated = self.service.get_generated_video(review["lessonId"], Path(review["generatedManifest"]))
+                video_id = client.upload_video(Path(generated.video_path), review["metadata"], receipt, checkpoint, before_write=still_current)
+                # YouTube processing may not yet expose a usable duration. The saved ID
+                # prevents any retry from inserting a second video while waiting.
+                client.verify_video(video_id, review["channelId"], review["durationSeconds"], expected_privacy="private",
+                                    expected_title=review["metadata"]["snippet"]["title"])
+                for language, content in files.items():
+                    track = client.deliver(video_id, language, content, before_write=still_current)
+                    receipt["tracks"] = [track]
+                    checkpoint()
+                still_current()
+                receipt["status"] = "verified_private_delivery" if all(track["verified"] for track in receipt["tracks"]) else "awaiting_youtube_processing"
+                receipt["finishedAt"] = _now()
+                checkpoint()
+            except Exception:
+                receipt["status"] = "interrupted_reconcile_required"
+                receipt["finishedAt"] = _now()
+                checkpoint()
+                raise
+        # The resumable session URI is a credential-like capability, private even on errors.
+        return {**{key: value for key, value in receipt.items() if key != "uploadSession"}, "receiptPath": str(receipt_path)}

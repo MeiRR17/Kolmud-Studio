@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Automatic original video from Hebrew audio or a UTF-8 Hebrew script: local 1080p
+  RTL-aware text slides, English narration at its natural pace, poster, storyboard
+  and SRT. CLI video target, studio panel and API; no filmed source video or prebuilt
+  external project required. Script input skips ASR entirely.
+- New generated-video YouTube route: reviewed private upload via checkpointed resumable
+  chunks, server offset recovery, saved video ID, native English captions and remote
+  ownership/privacy/title/content verification. Interrupted uploads never blindly start
+  a second video. Live account behavior is still unverified.
 - Original-source timeline: Whisper word evidence, retained transcription generations,
   versioned source-cue editing with audit history, confidence/timing review flags, and
   source-linked translation. Export bilingual anchored SRT without running TTS.
