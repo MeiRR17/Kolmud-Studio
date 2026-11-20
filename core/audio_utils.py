@@ -6,8 +6,23 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import soundfile as sf
+
+
+def non_silent_intervals(audio: Any, top_db: float, frame: int = 1024, hop: int = 256) -> list[tuple[int, int]]:
+    """Sample ranges louder than `top_db` below the peak frame energy (like librosa.effects.split)."""
+    import numpy as np
+
+    if len(audio) < frame:
+        return [(0, len(audio))] if len(audio) else []
+    frames = np.lib.stride_tricks.sliding_window_view(audio, frame)[::hop]
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+    db = 20 * np.log10(np.maximum(rms, 1e-10) / max(float(rms.max()), 1e-10))
+    loud = np.concatenate([[False], db > -top_db, [False]])
+    edges = np.flatnonzero(np.diff(loud.astype(np.int8)))
+    return [(int(a) * hop, min(int(b) * hop + frame, len(audio))) for a, b in zip(edges[::2], edges[1::2])]
 
 
 class AudioToolError(RuntimeError):
@@ -125,3 +140,70 @@ def write_srt(cues: list[SubtitleCue], dst: Path, max_chars: int = 84) -> Path:
             t += span
     dst.write_text("\n".join(lines), encoding="utf-8")
     return dst
+
+
+# ---------------------------------------------------------------------- reference voice check
+@dataclass
+class VoiceCheck:
+    """Quality report for a voice-cloning reference recording."""
+
+    duration_seconds: float
+    speech_seconds: float
+    loudness_dbfs: float
+    clipped_percent: float
+    errors: list[str]    # codes: the recording can't be used
+    warnings: list[str]  # codes: usable, but cloning quality may suffer
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+VOICE_CHECK_MESSAGES = {
+    "silent": "The recording is silent.",
+    "too_short": "Less than 6 seconds of speech; XTTS needs at least 6 (15-30 recommended).",
+    "short": "Under 12 seconds of speech; 15-30 seconds clones the voice more faithfully.",
+    "long": "Over 60 seconds; only the first 60 seconds are used.",
+    "pauses": "More than half of the recording is silence; speak continuously.",
+    "quiet": "Very quiet recording; move closer to the microphone.",
+    "clipping": "Distorted (clipped) audio; lower the input volume or move back a little.",
+}
+
+
+def check_and_trim_voice(src: Path, dst: Path | None = None, pad_seconds: float = 0.25) -> VoiceCheck:
+    """Measure a reference recording; if `dst` is given, write it there with outer silence trimmed."""
+    import numpy as np
+
+    audio, sr = sf.read(str(src), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    duration = len(audio) / sr if sr else 0.0
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if peak < 1e-4:
+        return VoiceCheck(round(duration, 2), 0.0, -120.0, 0.0, ["silent"], [])
+    intervals = non_silent_intervals(audio, top_db=35)
+    speech = sum(b - a for a, b in intervals) / sr
+    voiced = np.concatenate([audio[a:b] for a, b in intervals])
+    loudness = float(20 * np.log10(max(float(np.sqrt(np.mean(np.square(voiced, dtype=np.float64)))), 1e-10)))
+    clipped = 100.0 * float(np.mean(np.abs(audio) >= 0.99))
+
+    errors, warnings = [], []
+    if speech < 6:
+        errors.append("too_short")
+    elif speech < 12:
+        warnings.append("short")
+    if duration > 60:
+        warnings.append("long")
+    if speech < 0.5 * duration:
+        warnings.append("pauses")
+    if loudness < -35:
+        warnings.append("quiet")
+    if clipped > 0.1:
+        warnings.append("clipping")
+
+    if dst is not None:
+        pad = int(pad_seconds * sr)
+        start, end = max(intervals[0][0] - pad, 0), min(intervals[-1][1] + pad, len(audio))
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(dst), audio[start:end], sr, subtype="PCM_16")
+    return VoiceCheck(round(duration, 2), round(speech, 2), round(loudness, 1), round(clipped, 3), errors, warnings)

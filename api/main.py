@@ -5,21 +5,24 @@ Run:  uvicorn api.main:app --reload --port 8000     ·  docs at http://localhost
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core import __version__
-from core.audio_utils import AudioToolError
+from core.audio_utils import VOICE_CHECK_MESSAGES, AudioToolError
 from core.config import detect_hardware, get_settings
 from core.llm_translator import TranslationError, list_ollama_models
 from core.pipeline import LLMChoice, NotFoundError, StudioService, TTSChoice, WorkflowStateError
 from core.runtime import PipelineBusyError
 from core.schemas import AttemptOut, LessonOut, LessonSummary, MasterOutputs, SegmentOut, SegmentUpdate
+from core.schemas import SourceCaptionOutputs, SourceCueOut, SourceCueUpdate, SourceTimelineOut
+from core.schemas import DubbingPlan, SynchronizedOutputs, GeneratedVideoOutputs
 from core.tts_cloner import TTSError
 
 app = FastAPI(title="Kolmud Studio — TorahVoice & Accent Lab", version=__version__)
@@ -66,12 +69,17 @@ class TranslateRequest(BaseModel):
     model: str | None = None
     api_key: str = ""
     base_url: str = ""
+    source_timed: bool = False
 
 
 class SynthesizeRequest(BaseModel):
     engine: Literal["xtts", "elevenlabs"] | None = None
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
+
+
+class DubbingRequest(BaseModel):
+    max_speed: float = Field(default=1.15, ge=1, le=1.25, allow_inf_nan=False)
 
 
 class LexiconEntry(BaseModel):
@@ -101,8 +109,9 @@ def health(svc: Service) -> dict:
 
 @app.put("/voice-profile")
 async def upload_reference_voice(svc: Service, file: UploadFile = File(...)) -> dict:
-    path = svc.save_reference_voice(file.filename or "voice.wav", await file.read())
-    return {"reference_voice_path": str(path)}
+    check = svc.save_reference_voice(file.filename or "voice.wav", await file.read())
+    return {"reference_voice_path": str(svc.settings.reference_voice_path), "check": asdict(check),
+            "warnings": [VOICE_CHECK_MESSAGES[code] for code in check.warnings]}
 
 
 # ---------------------------------------------------------------- lessons
@@ -149,7 +158,29 @@ def translate_lesson(lesson_id: int, svc: Service, body: TranslateRequest | None
         choice = LLMChoice(body.provider, body.model or choice.model, body.api_key, body.base_url)
     elif body and body.model:
         choice.model = body.model
-    return svc.translate(lesson_id, choice)
+    return svc.translate(lesson_id, choice, source_timed=body.source_timed if body else False)
+
+
+@app.get("/lessons/{lesson_id}/source-timeline", response_model=SourceTimelineOut)
+def get_source_timeline(lesson_id: int, svc: Service) -> SourceTimelineOut:
+    return svc.get_source_timeline(lesson_id)
+
+
+@app.patch("/source-cues/{cue_id}", response_model=SourceCueOut)
+def update_source_cue(cue_id: int, body: SourceCueUpdate, svc: Service) -> SourceCueOut:
+    return svc.update_source_cue(cue_id, body)
+
+
+@app.post("/lessons/{lesson_id}/source-captions", response_model=SourceCaptionOutputs)
+def build_source_captions(lesson_id: int, svc: Service, hebrew_only: bool = False) -> SourceCaptionOutputs:
+    return svc.build_source_captions(lesson_id, include_english=not hebrew_only)
+
+
+@app.get("/lessons/{lesson_id}/source-captions/{language}")
+def download_source_captions(lesson_id: int, language: Literal["he", "en"], svc: Service) -> FileResponse:
+    result = svc.build_source_captions(lesson_id, include_english=language == "en")
+    return FileResponse(result.hebrew_srt_path if language == "he" else result.english_srt_path,
+                        media_type="application/x-subrip", filename=f"lesson_{lesson_id}.source.{language}.srt")
 
 
 @app.post("/lessons/{lesson_id}/synthesize", response_model=LessonOut)
@@ -166,6 +197,11 @@ def synthesize_lesson(lesson_id: int, svc: Service, body: SynthesizeRequest | No
 @app.post("/lessons/{lesson_id}/master", response_model=MasterOutputs)
 def build_master(lesson_id: int, svc: Service) -> MasterOutputs:
     return svc.build_master(lesson_id)
+
+
+@app.post("/lessons/{lesson_id}/generated-video", response_model=GeneratedVideoOutputs)
+def generate_lesson_video(lesson_id: int, svc: Service) -> GeneratedVideoOutputs:
+    return svc.build_generated_video(lesson_id)
 
 
 @app.get("/lessons/{lesson_id}/master/{kind}")
@@ -189,6 +225,21 @@ def regenerate_phonetic(segment_id: int, svc: Service) -> SegmentOut:
 @app.post("/segments/{segment_id}/synthesize", response_model=SegmentOut)
 def synthesize_segment(segment_id: int, svc: Service, body: SynthesizeRequest | None = None) -> SegmentOut:
     return svc.synthesize_segment(segment_id, _tts_choice(svc, body))
+
+
+@app.put("/segments/{segment_id}/recording", response_model=SegmentOut)
+async def upload_segment_recording(segment_id: int, svc: Service, file: UploadFile = File(...)) -> SegmentOut:
+    return svc.attach_segment_recording(segment_id, file.filename or "english.wav", await file.read())
+
+
+@app.get("/lessons/{lesson_id}/dubbing-plan", response_model=DubbingPlan)
+def get_dubbing_plan(lesson_id: int, svc: Service, max_speed: float = 1.15) -> DubbingPlan:
+    return svc.get_dubbing_plan(lesson_id, max_speed)
+
+
+@app.post("/lessons/{lesson_id}/synchronized-audio", response_model=SynchronizedOutputs)
+def build_synchronized_audio(lesson_id: int, svc: Service, body: DubbingRequest | None = None) -> SynchronizedOutputs:
+    return svc.build_synchronized_audio(lesson_id, body.max_speed if body else 1.15)
 
 
 @app.get("/segments/{segment_id}/audio")

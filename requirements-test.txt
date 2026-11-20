@@ -9,6 +9,7 @@ SQLAlchemy
 httpx
 numpy
 soundfile
+Pillow
 jiwer
 num2words
 pydub

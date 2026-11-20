@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     elevenlabs_model: str = "eleven_multilingual_v2"
     segment_pause_ms: int = 600
 
+    # Optional existing local font; never downloaded by the video renderer.
+    video_font_path: Path | None = None
+
     @property
     def projects_dir(self) -> Path:
         return self.data_dir / "projects"

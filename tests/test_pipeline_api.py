@@ -112,3 +112,59 @@ def test_ollama_model_is_unloaded_after_translation_even_on_failure(service, mon
     except TranslationError:
         pass
     assert unloaded == ["gemma4:26b", "gemma4:26b"]
+
+
+def _voice_wav(tmp_path: Path, speech_seconds: float, lead_silence: float = 2.0, amplitude: float = 0.3,
+               name: str = "voice.wav") -> bytes:
+    import numpy as np
+    import soundfile as sf
+
+    sr = 24000
+    rng = np.random.default_rng(1)
+    # "Speech": noise bursts of 0.8 s with 0.15 s gaps, so pauses are realistic.
+    parts = [np.zeros(int(lead_silence * sr), dtype="float32")]
+    while sum(len(p) for p in parts[1:]) < speech_seconds * sr:
+        parts += [amplitude * rng.standard_normal(int(0.8 * sr)).astype("float32").clip(-1, 1),
+                  np.zeros(int(0.15 * sr), dtype="float32")]
+    parts.append(np.zeros(int(lead_silence * sr), dtype="float32"))
+    path = tmp_path / name
+    sf.write(str(path), np.concatenate(parts), sr)
+    return path.read_bytes()
+
+
+def test_reference_voice_is_checked_trimmed_and_bad_takes_keep_the_old_one(service: StudioService, tmp_path: Path) -> None:
+    from core.audio_utils import duration_seconds
+    from core.pipeline import VoiceRejectedError
+
+    check = service.save_reference_voice("good.wav", _voice_wav(tmp_path, 20))
+    assert check.ok and check.warnings == [] and 15 < check.speech_seconds < 22
+    ref = service.settings.reference_voice_path
+    good_bytes = ref.read_bytes()
+    assert duration_seconds(ref) < check.duration_seconds - 3  # 2 s of silence trimmed at each end
+
+    for data, code in ((_voice_wav(tmp_path, 3, name="short.wav"), "too_short"),
+                       (_voice_wav(tmp_path, 10, amplitude=0.0, name="silent.wav"), "silent")):
+        try:
+            service.save_reference_voice("bad.wav", data)
+            raise AssertionError("bad take accepted")
+        except VoiceRejectedError as exc:
+            assert exc.check.errors == [code]
+        assert ref.read_bytes() == good_bytes  # previous voice kept
+    assert not list(ref.parent.glob(".*"))  # no temp files left behind
+
+    assert "short" in service.save_reference_voice("s.wav", _voice_wav(tmp_path, 9, name="s.wav")).warnings
+    assert "quiet" in service.save_reference_voice("q.wav", _voice_wav(tmp_path, 20, amplitude=0.005, name="q.wav")).warnings
+    assert "clipping" in service.save_reference_voice("c.wav", _voice_wav(tmp_path, 20, amplitude=3.0, name="c.wav")).warnings
+    assert service.reference_voice_check().warnings == ["clipping"]
+
+
+def test_voice_profile_endpoint_reports_check(service: StudioService, tmp_path: Path) -> None:
+    app.dependency_overrides[get_service] = lambda: service
+    try:
+        client = TestClient(app)
+        ok = client.put("/voice-profile", files={"file": ("v.wav", _voice_wav(tmp_path, 9), "audio/wav")}).json()
+        assert ok["check"]["errors"] == [] and ok["warnings"] and "15-30" in ok["warnings"][0]
+        bad = client.put("/voice-profile", files={"file": ("v.wav", _voice_wav(tmp_path, 2, name="b.wav"), "audio/wav")})
+        assert bad.status_code == 409 and "rejected" in bad.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
