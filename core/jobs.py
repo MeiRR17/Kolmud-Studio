@@ -22,7 +22,7 @@ from core.audio_utils import AudioToolError
 from core.pipeline import StudioService, WorkflowStateError, file_digest
 from core.runtime import PipelineBusyError, file_lock
 
-STAGES = ("transcript", "translation", "audio", "master")
+STAGES = ("transcript", "translation", "audio", "master", "synchronized")
 
 
 def now() -> str:
@@ -65,14 +65,14 @@ class PipelineRunner:
         job["updatedAt"] = now()
         private_json(self._path(job["id"]), job)
 
-    def _policy(self, until: str) -> None:
+    def _policy(self, until: str, voice_mode: str = "synthetic") -> None:
         settings = self.service.settings
         if STAGES.index(until) >= 1:
             if settings.llm_provider != "ollama" or not loopback_url(settings.ollama_base_url):
                 raise WorkflowStateError("CLI jobs require local Ollama on a loopback URL; cloud translation is disabled.")
-        if STAGES.index(until) >= 2 and settings.tts_engine != "xtts":
+        if STAGES.index(until) >= 2 and voice_mode != "recorded" and settings.tts_engine != "xtts":
             raise WorkflowStateError("CLI jobs require local XTTS; cloud voice APIs are disabled.")
-        if STAGES.index(until) >= 2:
+        if STAGES.index(until) >= 2 and voice_mode != "recorded":
             if not settings.xtts_accept_cpml:
                 raise WorkflowStateError("Read the XTTS license and explicitly set XTTS_ACCEPT_CPML=true before synthesis.")
             if not settings.reference_voice_path.is_file():
@@ -80,7 +80,8 @@ class PipelineRunner:
 
     def run(self, source: Path | None = None, *, job_id: str | None = None,
             until: str | None = None, title: str | None = None, goal_ids: list[str] | None = None,
-            on_started: Callable[[str], None] | None = None, source_timed: bool | None = None) -> dict:
+            on_started: Callable[[str], None] | None = None, source_timed: bool | None = None,
+            voice_mode: str | None = None, max_speed: float | None = None) -> dict:
         with file_lock(self.service.settings.data_dir / ".jobs.lock"):
             if job_id:
                 job = self.read(job_id)
@@ -103,8 +104,21 @@ class PipelineRunner:
             target = until or job["until"]
             if target not in STAGES:
                 raise ValueError("Unknown pipeline stage.")
+            if target == "synchronized":
+                job["translationMode"] = "source_timed"
+            if voice_mode is not None:
+                job["voiceMode"] = voice_mode
+            job.setdefault("voiceMode", "synthetic")
+            if job["voiceMode"] not in ("synthetic", "recorded", "mixed"):
+                raise ValueError("Unknown voice mode.")
+            if max_speed is not None:
+                job["maxSpeed"] = max_speed
+            job.setdefault("maxSpeed", 1.15)
+            import math
+            if not math.isfinite(job["maxSpeed"]) or not 1 <= job["maxSpeed"] <= 1.25:
+                raise ValueError("Maximum dubbing speed must be between 1.0 and 1.25.")
             # Fail before attaching private audio or invoking any model.
-            self._policy(target)
+            self._policy(target, job["voiceMode"])
             job.update(until=target, status="RUNNING", attempts=job["attempts"] + 1, errorType=None, errorMessage=None)
             for field in ("manifestPath", "reviewPath", "handoffErrorType", "sourceCaptions"):
                 job.pop(field, None)
@@ -195,15 +209,22 @@ class PipelineRunner:
             return
 
         self._stage(job, "audio")
-        voice = {"referenceSha256": file_digest(settings.reference_voice_path), "engine": "XTTS-v2",
-                 "temperature": settings.xtts_temperature, "speed": settings.xtts_speed, "devicePreference": settings.tts_device}
-        if job.get("voice") and job["voice"] != voice:
+        mode = job["voiceMode"]
+        voice = ({"engine": "human_recordings"} if mode == "recorded" else
+                 {"referenceSha256": file_digest(settings.reference_voice_path), "engine": "XTTS-v2",
+                  "temperature": settings.xtts_temperature, "speed": settings.xtts_speed, "devicePreference": settings.tts_device})
+        if mode != "recorded" and job.get("voice", {}).get("engine") == "XTTS-v2" and job["voice"] != voice:
             raise WorkflowStateError("Voice settings changed; restore the original voice/settings or start a new job.")
         job["voice"] = voice
         self._save(job)
         for seg in lesson.segments:
             path = svc.abs_path(seg.audio_path)
-            if path is None or not path.is_file() or seg.audio_is_stale:
+            ready = path is not None and path.is_file() and not seg.audio_is_stale
+            if mode == "recorded":
+                if not ready or seg.audio_origin != "recorded":
+                    raise WorkflowStateError(f"Attach a current English recording for paragraph {seg.position} (segment {seg.id}) with kolmud recording, then resume; recorded mode never synthesizes speech.")
+                continue
+            if not ready or (mode == "synthetic" and seg.audio_origin == "recorded"):
                 svc.synthesize_segment(seg.id)
                 # Record where synthesis really ran: a silent MPS->CPU fallback is ~5x slower.
                 device = getattr(svc.make_tts_engine(), "device", None)
@@ -212,6 +233,22 @@ class PipelineRunner:
                 self._save(job)
         self._complete(job, "audio")
         if job["until"] == "audio":
+            return
+
+        if job["until"] == "synchronized":
+            self._stage(job, "synchronized")
+            previous = job.get("synchronizedOutputs", {})
+            try:
+                if not previous:
+                    raise WorkflowStateError("No synchronized generation yet.")
+                result = svc.get_synchronized_audio(lesson.id, Path(previous["manifest_path"]))
+                manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+                if manifest["maxSpeed"] != job["maxSpeed"]:
+                    raise WorkflowStateError("Requested timing settings changed.")
+            except WorkflowStateError:
+                result = svc.build_synchronized_audio(lesson.id, job["maxSpeed"])
+            job["synchronizedOutputs"] = result.model_dump()
+            self._complete(job, "synchronized")
             return
 
         self._stage(job, "master")
@@ -232,14 +269,20 @@ class PipelineRunner:
         if target >= 1 and (not lesson.segments or lesson.translation_is_stale):
             raise WorkflowStateError("Translation is missing or out of date.")
         if target >= 2:
-            if file_digest(self.service.settings.reference_voice_path) != job["voice"]["referenceSha256"]:
+            if job["voiceMode"] != "recorded" and file_digest(self.service.settings.reference_voice_path) != job["voice"]["referenceSha256"]:
                 raise WorkflowStateError("Reference voice changed during the run.")
             for seg in lesson.segments:
                 path = self.service.abs_path(seg.audio_path)
                 if path is None or not path.is_file() or seg.audio_is_stale:
                     raise WorkflowStateError(f"Paragraph {seg.position} has missing or stale audio.")
-        if target >= 3:
+                if job["voiceMode"] == "recorded" and seg.audio_origin != "recorded":
+                    raise WorkflowStateError("Recorded voice mode requires authentic paragraph recordings.")
+                if job["voiceMode"] == "synthetic" and seg.audio_origin == "recorded":
+                    raise WorkflowStateError("Voice origin changed during synthesis.")
+        if job["until"] == "master":
             self.service.get_master(lesson.id)
+        elif job["until"] == "synchronized":
+            self.service.get_synchronized_audio(lesson.id, Path(job["synchronizedOutputs"]["manifest_path"]))
 
     def _handoff(self, job: dict) -> None:
         """Produce metadata and bounded review JSON; never publish or approve it."""
@@ -279,7 +322,15 @@ class PipelineRunner:
                 for seg in lesson.segments:
                     path = self.service.abs_path(seg.audio_path)
                     if path and path.is_file() and not seg.audio_is_stale:
-                        asset(f"Synthetic paragraph {seg.position}", path)
+                        origin = "Recorded" if seg.audio_origin == "recorded" else "Synthetic"
+                        asset(f"{origin} paragraph {seg.position}", path)
+            if job["until"] == "synchronized" and job["status"] != "FAILED":
+                synced = self.service.get_synchronized_audio(lesson.id, Path(job["synchronizedOutputs"]["manifest_path"]))
+                for key, label in (("wav_path", "Synchronized English WAV"), ("mp3_path", "Synchronized English MP3"),
+                                   ("english_srt_path", "Synchronized English SRT"), ("video_path", "Synchronized English video"),
+                                   ("manifest_path", "Synchronized generation manifest")):
+                    if getattr(synced, key):
+                        asset(label, Path(getattr(synced, key)))
             if lesson.master_audio_path and job["status"] != "FAILED":
                 # A master left over from an earlier, broader run may no longer be current;
                 # list only a verified one instead of failing a narrower (e.g. audio) job.
@@ -303,11 +354,12 @@ class PipelineRunner:
         if STAGES.index(job["until"]) >= 1:
             questions.append("Check translation fidelity and Torah terminology against the original; this is not a source-verified lesson or psak.")
         if STAGES.index(job["until"]) >= 2:
-            questions.append("Listen to the generated voice and check pronunciation. Synthetic voice does not replace an authentic teacher recording when one is required.")
+            questions.append("Listen to the English recordings/synthesis and check pronunciation and synchronization. Synthetic voice does not replace an authentic teacher recording when one is required.")
         manifest = {"schemaVersion": 1, "producer": {"name": "Kolmud Studio", "version": __version__},
                     "jobId": job["id"], "lessonId": job["lessonId"], "status": job["status"],
                     "requestedStage": job["until"], "translationMode": job["translationMode"], "source": job["source"], "goalIds": job["goalIds"],
-                    "models": job["models"], "voice": job.get("voice"), "assets": assets, "checks": checks, "openQuestions": questions}
+                    "models": job["models"], "voice": job.get("voice"), "voiceMode": job["voiceMode"],
+                    "assets": assets, "checks": checks, "openQuestions": questions}
         manifest_path = directory / "manifest.json"
         private_json(manifest_path, manifest)
         report = {

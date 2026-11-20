@@ -20,12 +20,16 @@ def main(argv=None) -> int:
     run.add_argument("source", type=Path)
     run.add_argument("--title")
     run.add_argument("--goal-id", action="append", default=[])
-    run.add_argument("--until", choices=("transcript", "translation", "audio", "master"), default="transcript")
+    run.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized"), default="transcript")
     run.add_argument("--source-timed", action="store_true", help="Keep explicit source-cue links and export captions on the original timeline.")
     resume = commands.add_parser("resume", help="Resume an existing job; optionally extend its target stage.")
     resume.add_argument("job_id")
-    resume.add_argument("--until", choices=("transcript", "translation", "audio", "master"))
+    resume.add_argument("--until", choices=("transcript", "translation", "audio", "master", "synchronized"))
     resume.add_argument("--source-timed", action="store_true", default=None)
+    for command in (run, resume):
+        command.add_argument("--voice-mode", choices=("synthetic", "recorded", "mixed"), default=None,
+                             help="recorded never calls TTS; mixed preserves recordings and synthesizes missing paragraphs.")
+        command.add_argument("--max-speed", type=float, help="Synchronized speech speed cap (1–1.25; default 1.15).")
     status = commands.add_parser("status", help="Inspect a saved checkpoint.")
     status.add_argument("job_id")
     commands.add_parser("jobs", help="List persisted jobs.")
@@ -43,6 +47,20 @@ def main(argv=None) -> int:
         command = commands.add_parser(name, help=description)
         command.add_argument("lesson_id", type=int)
         command.add_argument("--max-speed", type=float, default=1.15)
+    connect = commands.add_parser("youtube-connect", help="Explicitly connect your Google Desktop OAuth app in the browser.")
+    connect.add_argument("client_config", type=Path)
+    connect.add_argument("--credentials", type=Path)
+    prepare = commands.add_parser("youtube-prepare", help="Prepare an immutable caption generation for owner review (no network).")
+    prepare.add_argument("lesson_id", type=int)
+    prepare.add_argument("video_id")
+    prepare.add_argument("--channel-id", required=True)
+    prepare.add_argument("--hebrew-only", action="store_true")
+    approve = commands.add_parser("youtube-approve", help="Record your review of specific captions, timings and selected video.")
+    approve.add_argument("review", type=Path)
+    approve.add_argument("--reviewed", action="store_true", required=True)
+    publish = commands.add_parser("youtube-publish", help="Upload/update reviewed native captions and verify remote content.")
+    publish.add_argument("review", type=Path)
+    publish.add_argument("--credentials", type=Path)
     args = parser.parse_args(argv)
     # Engine warnings (e.g. XTTS falling back from Metal to CPU) go to stderr; stdout stays JSON.
     logging.basicConfig(level=logging.WARNING, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
@@ -65,7 +83,10 @@ def main(argv=None) -> int:
         # Model libraries often print progress to stdout. Keep the command's
         # JSON response parseable by the coordinator and route chatter to stderr.
         with redirect_stdout(sys.stderr):
-            if args.command == "doctor":
+            if args.command == "youtube-connect":
+                from core.youtube import DEFAULT_CREDENTIALS, connect
+                result = connect(args.client_config, args.credentials or DEFAULT_CREDENTIALS)
+            elif args.command == "doctor":
                 from core.llm_translator import list_ollama_models
                 models = list_ollama_models(settings.ollama_base_url) if loopback_url(settings.ollama_base_url) else []
                 result = {"version": __version__, "dataDir": str(settings.data_dir.resolve()), "hardware": detect_hardware(),
@@ -81,9 +102,11 @@ def main(argv=None) -> int:
                 runner = PipelineRunner(StudioService(settings))
                 started = lambda job_id: print(f"Job ID: {job_id} (resume with: kolmud resume {job_id})", file=sys.stderr)
                 if args.command == "run":
-                    result = runner.run(args.source, until=args.until, title=args.title, goal_ids=args.goal_id, on_started=started, source_timed=args.source_timed)
+                    result = runner.run(args.source, until=args.until, title=args.title, goal_ids=args.goal_id, on_started=started,
+                                        source_timed=args.source_timed, voice_mode=args.voice_mode, max_speed=args.max_speed)
                 elif args.command == "resume":
-                    result = runner.run(job_id=args.job_id, until=args.until, on_started=started, source_timed=args.source_timed)
+                    result = runner.run(job_id=args.job_id, until=args.until, on_started=started, source_timed=args.source_timed,
+                                        voice_mode=args.voice_mode, max_speed=args.max_speed)
                 elif args.command == "status":
                     result = runner.read(args.job_id)
                 elif args.command == "timeline":
@@ -97,6 +120,21 @@ def main(argv=None) -> int:
                     result = runner.service.get_dubbing_plan(args.lesson_id, args.max_speed).model_dump()
                 elif args.command == "synchronize":
                     result = runner.service.build_synchronized_audio(args.lesson_id, args.max_speed).model_dump()
+                elif args.command.startswith("youtube-"):
+                    from core.publication import CaptionPublication
+                    publication = CaptionPublication(runner.service)
+                    if args.command == "youtube-prepare":
+                        result = publication.prepare(args.lesson_id, args.video_id, args.channel_id,
+                                                     include_english=not args.hebrew_only)
+                    elif args.command == "youtube-approve":
+                        result = publication.approve(args.review, reviewed=args.reviewed)
+                    else:
+                        from core.youtube import DEFAULT_CREDENTIALS, CaptionClient
+                        client = CaptionClient(args.credentials or DEFAULT_CREDENTIALS)
+                        try:
+                            result = publication.publish(args.review, client)
+                        finally:
+                            client.close()
                 else:
                     result = runner.list_jobs()
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -640,6 +640,39 @@ class StudioService:
             raise FileNotFoundError("No audio has been generated for this segment yet.")
         return audio_utils.tempo_variant(path, rate)
 
+    def get_synchronized_audio(self, lesson_id: int, manifest_path: Path) -> SynchronizedOutputs:
+        """Reuse a generation only while all source, paragraph and output hashes agree."""
+        directory = manifest_path.expanduser().resolve().parent
+        expected_root = (self._lesson_dir(lesson_id) / "synchronized").resolve()
+        if directory.parent != expected_root or manifest_path.name != "manifest.json":
+            raise WorkflowStateError("Synchronized generation does not belong to this lesson.")
+        try:
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            plan = self.get_dubbing_plan(lesson_id, manifest["maxSpeed"])
+            if not plan.ready or manifest["lessonId"] != lesson_id or manifest["sourceSnapshot"] != plan.source_snapshot or manifest["inputSegments"] != plan.segments or manifest["durationSeconds"] != plan.duration_seconds:
+                raise WorkflowStateError("Synchronized inputs changed; rebuild the generation.")
+            names = {"source_synced.en.wav", "source_synced.en.mp3", "source_synced.en.srt"}
+            if plan.original_video_path:
+                names.add("source_synced.en.mp4")
+            actual = set()
+            for item in manifest["files"]:
+                path = Path(item["path"]).resolve()
+                if path.parent != directory or path.name not in names or file_digest(path) != item["sha256"]:
+                    raise WorkflowStateError("Synchronized output files changed; rebuild the generation.")
+                actual.add(path.name)
+            if actual != names:
+                raise WorkflowStateError("Synchronized output generation is incomplete.")
+            if self.get_dubbing_plan(lesson_id, manifest["maxSpeed"]) != plan:
+                raise WorkflowStateError("Synchronized inputs changed during verification.")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise WorkflowStateError("Synchronized generation is missing or invalid; rebuild it.") from exc
+        return SynchronizedOutputs(wav_path=str(directory / "source_synced.en.wav"),
+                                   mp3_path=str(directory / "source_synced.en.mp3"),
+                                   english_srt_path=str(directory / "source_synced.en.srt"),
+                                   video_path=str(directory / "source_synced.en.mp4") if plan.original_video_path else None,
+                                   manifest_path=str(directory / "manifest.json"),
+                                   duration_seconds=plan.duration_seconds, segment_count=len(plan.segments))
+
     def _export_inputs(self, lesson: Lesson) -> tuple[list[Path], list[str], str]:
         self._require_current_translation(lesson)
         missing, stale, paths, texts, fingerprints = [], [], [], [], []

@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Original-source timeline: Whisper word evidence, retained transcription generations,
+  versioned source-cue editing with audit history, confidence/timing review flags, and
+  source-linked translation. Export bilingual anchored SRT without running TTS.
+- User English recordings per paragraph, synthetic and mixed routes; source-timed WAV,
+  MP3, SRT and optional original-video-stream MP4. Bounded tempo, exact silence gaps,
+  no silent truncation, stale/concurrent-input rejection and output integrity checks.
+- CLI synchronized job target, persistent voice modes and verified resume; recorded
+  mode needs no TTS provider/license/reference. Dvir handoffs include current source
+  captions and synchronized assets with accurate recorded/synthetic labels.
+- Native YouTube caption connector with Desktop OAuth/PKCE, private refresh storage
+  outside the checkout, owner/video checks, generation-bound review, upload/update,
+  remote readback, partial delivery receipts and retry reconciliation. No live account
+  was connected or modified during development; Google HTTP exchanges are simulated.
+- Completion checklist and operator instructions distinguish implemented segment
+  anchors from the remaining full-recording alignment, logical QA and Dvir UI bridge.
 - Reference voice check on save (UI, API `PUT /voice-profile`, `kolmud doctor`): outer silence
   trimmed; silent takes or < 6 s of speech rejected without replacing the current voice;
   warnings for short, long, quiet, clipped or pause-heavy takes. The sidebar offers a ready
@@ -10,10 +25,11 @@
   mirror of `parseRun`; with a local Dvir OS checkout (`DVIR_OS_DIR`) the real parser runs too.
 - CI: actions/checkout and actions/setup-python v7 (Node 24), runner pinned to ubuntu-24.04.
 
-## [0.2.0](https://github.com/MeiRR17/Kolmud-Studio/releases/tag/v0.2.0) — 2026-10-31
+## 0.2.0 — source milestone, 2026-10-31
 
-First release validated by a real-model pilot (2:34 Hebrew shiur → master export on the
-M1 Max). See "Pilot results" in the README for measurements.
+Source version validated by a real-model pilot (2:34 synthetic Hebrew shiur → master
+export on the M1 Max). This entry does not represent a published v0.2.0 GitHub Release;
+the latest published Release is v0.1.0. See "Pilot results" in the README for measurements.
 
 ### Fixed from the pilot
 
